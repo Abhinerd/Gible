@@ -55,7 +55,7 @@ pip install -r requirements.txt
 
 **4. Ensure UI Assets are Present**
 
-Make sure the following icon files are present in the root directory of the project, alongside `main.py`:
+Make sure the following icon files are present in the images directory of the project:
 *   `folder.png`
 *   `file.png`
 
