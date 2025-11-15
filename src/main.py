@@ -120,14 +120,12 @@ class App(ctk.CTk):
             items = [item for item in sorted(os.listdir(path), key=str.lower) if not item.startswith('.')]
             dirs = [d for d in items if os.path.isdir(os.path.join(path, d))]
             files = [f for f in items if os.path.isfile(os.path.join(path, f))]
-            if self.folder_icon:
-                for d in dirs: self.tree.insert('', 'end', text=f" {d}", image=self.folder_icon, values=("dir",))
-            else:
-                for d in dirs: self.tree.insert('', 'end', text=f" {d} [dir]", values=("dir",))
-            if self.file_icon:
-                for f in files: self.tree.insert('', 'end', text=f" {f}", image=self.file_icon, values=("file",))
-            else:
-                for f in files: self.tree.insert('', 'end', text=f" {f} [file]", values=("file",))
+            
+            for d in dirs:
+                self.tree.insert('', 'end', text=f" {d}", image=self.folder_icon, values=("dir", d))
+            for f in files:
+                self.tree.insert('', 'end', text=f" {f}", image=self.file_icon, values=("file", f))
+
         except Exception as e: print(f"Error reading directory {path}: {e}")
 
     def commit_action(self):
@@ -331,7 +329,9 @@ class App(ctk.CTk):
         self.textbox.configure(state="normal"); self.textbox.delete("1.0", "end")
         
         viewable_extensions = ['.txt', '.md', '.py', '.html', '.css', '.js', '.json', '.xml']
-        if any(file_path.lower().endswith(ext) for ext in viewable_extensions):
+        filename = os.path.basename(file_path).strip().lower()
+        print(filename)
+        if any(filename.endswith(ext) for ext in viewable_extensions):
             self.textbox.insert("1.0", content_to_display)
         else:
             self.textbox.insert("1.0", "This file type is not editable."); self.textbox.configure(state="disabled")
@@ -409,9 +409,10 @@ class App(ctk.CTk):
             if not item_id:
                 return  # User clicked on empty space, do nothing
 
-            item_text = self.tree.item(item_id)['text'].strip()
-            item_type = self.tree.item(item_id)['values'][0]
-            selected_path = os.path.join(self.current_display_path, item_text)
+            item_values = self.tree.item(item_id)['values']
+            item_type = item_values[0]
+            real_name = item_values[1]
+            selected_path = os.path.join(self.current_display_path, real_name)
 
             if item_type == "dir":
                 self.current_display_path = selected_path
