@@ -74,9 +74,17 @@ class App(ctk.CTk):
         ctk.CTkButton(nav_bar, text="Upload Folder", width=100, command=self.upload_folder).pack(side="right", padx=5, pady=5)
         ctk.CTkButton(nav_bar, text="Upload File", width=100, command=self.upload_file).pack(side="right", padx=5, pady=5)
         self.tree = ttk.Treeview(self.file_explorer_frame, show='tree'); self._configure_treeview_style()
-        self.tree.grid(row=1, column=0, sticky='nsew'); self.tree.bind('<<TreeviewSelect>>', self.on_tree_select)
-        self.context_menu = Menu(self.tree, tearoff=0); self.context_menu.add_command(label="Create New File", command=self.create_new_file); self.context_menu.add_command(label="Create New Folder", command=self.create_new_folder); self.context_menu.add_separator(); self.context_menu.add_command(label="Delete", command=self.delete_selected_item)
-        self.tree.bind("<Button-3>", self.show_context_menu); self.tree.bind("<Button-2>", self.show_context_menu)
+        self.tree.grid(row=1, column=0, sticky='nsew')
+        
+        self.tree.bind('<Button-1>', self.on_tree_select) # Left-click to open
+        self.tree.bind("<Button-3>", self.show_context_menu) # Right-click (Windows/Linux)
+        self.tree.bind("<Button-2>", self.show_context_menu) # Right-click (macOS Trackpad)
+        
+        self.context_menu = Menu(self.tree, tearoff=0)
+        self.context_menu.add_command(label="Create New File", command=self.create_new_file)
+        self.context_menu.add_command(label="Create New Folder", command=self.create_new_folder)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Delete", command=self.delete_selected_item)
         
         self.file_viewer_frame = ctk.CTkFrame(right_panel, corner_radius=0, fg_color="transparent"); self.file_viewer_frame.grid(row=0, column=0, sticky="nsew")
         self.file_viewer_frame.grid_rowconfigure(1, weight=1); self.file_viewer_frame.grid_columnconfigure(0, weight=1)
@@ -194,9 +202,32 @@ class App(ctk.CTk):
         style.map("Treeview", background=[("selected", selected_color)], foreground=[("selected", text_color)])
         
     def show_context_menu(self, event):
+        """Identifies what was right-clicked and shows the appropriate context menu."""
         item_id = self.tree.identify_row(event.y)
-        if item_id: self.tree.selection_set(item_id); self.context_menu.entryconfigure("Delete", state="normal")
-        else: self.context_menu.entryconfigure("Delete", state="disabled"); self.tree.selection_set()
+        
+        if item_id:
+            # User right-clicked on an item (file or folder)
+            self.tree.selection_set(item_id) # Select the item
+            item_type = self.tree.item(item_id)['values'][0]
+            
+            # For either files or folders, "Delete" is a valid option
+            self.context_menu.entryconfigure("Delete", state="normal")
+
+            # "Create" options are only logical within a folder, not on a file
+            if item_type == "file":
+                self.context_menu.entryconfigure("Create New File", state="disabled")
+                self.context_menu.entryconfigure("Create New Folder", state="disabled")
+            else: # It's a directory
+                self.context_menu.entryconfigure("Create New File", state="normal")
+                self.context_menu.entryconfigure("Create New Folder", state="normal")
+        else:
+            # User right-clicked on empty space in the current directory
+            self.tree.selection_set() # Deselect any previously selected item
+            self.context_menu.entryconfigure("Create New File", state="normal")
+            self.context_menu.entryconfigure("Create New Folder", state="normal")
+            self.context_menu.entryconfigure("Delete", state="disabled")
+
+        # Display the menu at the cursor's location
         self.context_menu.post(event.x_root, event.y_root)
         
     def create_new_file(self):
@@ -373,18 +404,20 @@ class App(ctk.CTk):
         self.show_file_explorer()
         
     def on_tree_select(self, event):
-        item_id = self.tree.focus()
-        if not item_id: return
-        self.tree.unbind('<<TreeviewSelect>>')
-        item_text = self.tree.item(item_id)['text'].strip()
-        item_type = self.tree.item(item_id)['values'][0]
-        selected_path = os.path.join(self.current_display_path, item_text)
-        if item_type == "dir":
-            self.current_display_path = selected_path
-            self.populate_treeview(self.current_display_path)
-        else:
-            self.show_file_content(selected_path)
-        self.after(100, lambda: self.tree.bind('<<TreeviewSelect>>', self.on_tree_select))
+            """Handles opening a file or folder on a single left-click."""
+            item_id = self.tree.identify_row(event.y)
+            if not item_id:
+                return  # User clicked on empty space, do nothing
+
+            item_text = self.tree.item(item_id)['text'].strip()
+            item_type = self.tree.item(item_id)['values'][0]
+            selected_path = os.path.join(self.current_display_path, item_text)
+
+            if item_type == "dir":
+                self.current_display_path = selected_path
+                self.populate_treeview(self.current_display_path)
+            else:  # It's a file
+                self.show_file_content(selected_path)
 
     def navigate_up(self):
         if self.current_display_path and self.current_repo_path and self.current_display_path != self.current_repo_path:
