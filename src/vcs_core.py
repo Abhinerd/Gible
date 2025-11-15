@@ -44,11 +44,11 @@ class VCSEngine:
 
     def save_snapshot(self, file_path, new_content, current_undo_stack):
         """Saves a new snapshot if content has changed."""
-        previous_content = ""
+        previous_content = None
         if current_undo_stack:
             previous_content = self.get_content_from_snapshot(current_undo_stack[-1])
 
-        if new_content == previous_content:
+        if previous_content is not None and new_content == previous_content:
             return None # No changes to save
 
         file_history_path = self._get_file_history_path(file_path)

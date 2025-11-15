@@ -295,7 +295,7 @@ class App(ctk.CTk):
 
         new_content = "" if initial_save else self.textbox.get("1.0", "end-1c")
         
-        snapshot_path = self.vcs.save_snapshot(self.currently_editing_file, new_content, self.undo_stack)
+        snapshot_path = self.vcs.save_snapshot(self.currently_editing_file, new_content, None if initial_save else self.undo_stack)
         if snapshot_path:
             try:
                 with open(self.currently_editing_file, 'w', encoding='utf-8') as f:
@@ -330,7 +330,6 @@ class App(ctk.CTk):
         
         viewable_extensions = ['.txt', '.md', '.py', '.html', '.css', '.js', '.json', '.xml']
         filename = os.path.basename(file_path).strip().lower()
-        print(filename)
         if any(filename.endswith(ext) for ext in viewable_extensions):
             self.textbox.insert("1.0", content_to_display)
         else:
