@@ -268,6 +268,12 @@ class App(ctk.CTk):
         
         snapshot_path = self.vcs.save_snapshot(self.currently_editing_file, new_content, self.undo_stack)
         if snapshot_path:
+            try:
+                with open(self.currently_editing_file, 'w', encoding='utf-8') as f:
+                    f.write(new_content)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not write to file on disk.\n\nError: {e}")
+                return
             self.undo_stack.append(snapshot_path)
             self.redo_stack = []
             self.update_undo_redo_buttons()
@@ -302,7 +308,7 @@ class App(ctk.CTk):
         self.update_undo_redo_buttons()
         
     def undo_save(self):
-        if len(self.undo_stack) > 1 and self.vcs:
+        if len(self.undo_stack) >= 1 and self.vcs:
             self.redo_stack.append(self.undo_stack.pop())
             content = self.vcs.get_content_from_snapshot(self.undo_stack[-1])
             self.textbox.configure(state="normal"); self.textbox.delete("1.0", "end"); self.textbox.insert("1.0", content)
@@ -322,6 +328,11 @@ class App(ctk.CTk):
     def show_file_explorer(self):
         self.currently_editing_file = None; self.undo_stack = []; self.redo_stack = []
         self.textbox.configure(state="disabled")
+
+        selection = self.tree.selection()
+        if selection:
+            self.tree.selection_remove(selection)
+
         self.file_explorer_frame.tkraise()
         
     def close_repository_action(self):
