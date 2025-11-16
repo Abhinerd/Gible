@@ -589,6 +589,11 @@ def main():
             repo.merge_branch(sys.argv[2])
     elif cmd == "status":
         repo.status()
+    elif cmd == "checkout":
+        if len(sys.argv) < 3:
+            print("Usage: checkout <commit_oid>")
+        else:
+            repo.checkout(sys.argv[2])
     else:
         print(f"Unknown command: {cmd}")
 
