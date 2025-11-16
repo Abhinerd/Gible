@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Gible Phase-2: Text-diff storage + optional binary diffs (bsdiff4).
+Gible Phase-3: Branching + safe merge
 
 Features:
 - Text files: line-based diffs (SequenceMatcher)
 - Binary files: store full snapshot or binary diff if smaller
 - Commit objects reference per-file ("base" or "diff") object OIDs
 - Checkout reconstructs files applying chain back to base/diffs
-- Minimal: single master branch pointer, no merge features
+- Branch creation, switching, merge with safe JSON conflict files
 """
 from __future__ import annotations
 import os
@@ -20,8 +20,9 @@ from datetime import datetime
 from pathlib import Path
 from difflib import SequenceMatcher
 from typing import List, Tuple, Dict, Optional
-
-import bsdiff4  # Binary diff support
+import bsdiff4
+import uuid
+import base64
 
 # -------------------------
 # Configuration / Paths
@@ -36,9 +37,7 @@ CONFIG_FILE = "config.json"
 # Low-level utilities
 # -------------------------
 def calculate_hash(data: bytes, algo: str = "sha256") -> str:
-    if algo == "sha1":
-        return hashlib.sha1(data).hexdigest()
-    return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(data).hexdigest() if algo != "sha1" else hashlib.sha1(data).hexdigest()
 
 def compress_data(data: bytes) -> bytes:
     return zlib.compress(data, level=9)
@@ -168,13 +167,16 @@ class GibleRepository:
         self.metadata_filepath = os.path.join(self.repo_path, METADATA_FILE)
         self.config_filepath = os.path.join(self.repo_path, CONFIG_FILE)
 
+    # -------------------------
+    # Initialization
+    # -------------------------
     def init(self):
         if os.path.exists(self.repo_path):
             print(f"Repository already initialized at {self.repo_path}")
             return False
         os.makedirs(self.objects_path, exist_ok=True)
         initial_config = {
-            "version": "0.2.1-binarydiff",
+            "version": "0.3.0-branchmerge-safe",
             "created_at": datetime.now().isoformat(),
             "author": os.getenv("USER") or os.getenv("USERNAME") or "unknown"
         }
@@ -182,13 +184,14 @@ class GibleRepository:
             json.dump(initial_config, f, indent=2, ensure_ascii=False)
         initial_metadata = {
             "head": None,
+            "current_branch": "master",
             "branches": {"master": None},
             "commits": {}
         }
         with open(self.metadata_filepath, "w", encoding='utf-8') as f:
             json.dump(initial_metadata, f, indent=2, ensure_ascii=False)
         self.index.clear()
-        print(f"Initialized Gible Phase-2 repository at {self.repo_path}")
+        print(f"Initialized Gible Phase-3 repository at {self.repo_path}")
         return True
 
     def is_repo(self) -> bool:
@@ -210,11 +213,12 @@ class GibleRepository:
         with open(self.config_filepath, "r", encoding='utf-8') as f:
             return json.load(f)
 
+    # -------------------------
+    # Commit storage
+    # -------------------------
     def _write_commit_object(self, commit_obj: dict) -> str:
         commit_bytes = json.dumps(commit_obj, indent=2, ensure_ascii=False).encode('utf-8')
         oid = save_object(self.repo_path, commit_bytes, "commit")
-        commit_obj_with_hash = dict(commit_obj)
-        commit_obj_with_hash["hash"] = oid
         metadata = self.load_metadata()
         metadata["commits"][oid] = {
             "message": commit_obj.get("message", ""),
@@ -223,15 +227,16 @@ class GibleRepository:
             "parent": commit_obj.get("parent"),
             "files": commit_obj.get("files", {})
         }
+        current_branch = metadata.get("current_branch", "master")
+        metadata["branches"][current_branch] = oid
         metadata["head"] = oid
-        if "master" not in metadata.get("branches", {}) or metadata["branches"]["master"] == commit_obj.get("parent"):
-            metadata["branches"]["master"] = oid
         self.save_metadata(metadata)
         return oid
 
     def _get_full_commit(self, oid: str) -> dict:
         try:
             commit_bytes = load_object(self.repo_path, oid, "commit")
+            return json.loads(commit_bytes.decode('utf-8'))
         except FileNotFoundError:
             metadata = self.load_metadata()
             meta_entry = metadata["commits"].get(oid)
@@ -245,46 +250,40 @@ class GibleRepository:
                 "timestamp": meta_entry.get("timestamp"),
                 "files": meta_entry.get("files", {})
             }
-        return json.loads(commit_bytes.decode('utf-8'))
 
+    # -------------------------
+    # File reconstruction
+    # -------------------------
     def reconstruct_file_bytes(self, commit_oid: str, filepath: str) -> bytes:
         chain: List[Tuple[str, str]] = []
         current_oid = commit_oid
         while current_oid:
-            try:
-                commit_obj = self._get_full_commit(current_oid)
-            except FileNotFoundError:
-                break
+            commit_obj = self._get_full_commit(current_oid)
             files_map = commit_obj.get("files", {})
             if filepath in files_map:
                 entry = files_map[filepath]
                 chain.append((entry[0], entry[1]))
-            current_oid = commit_obj.get("parent")
+            parent = commit_obj.get("parent")
+            if isinstance(parent, list):
+                parent = parent[0]  # for merge commits, pick first parent
+            current_oid = parent
         if not chain:
             raise FileNotFoundError(f"File '{filepath}' not present in commit {commit_oid}")
         chain.reverse()
         base_type, base_oid = chain[0]
-        base_bytes = load_object(self.repo_path, base_oid, "base") if base_type == "base" else load_object(self.repo_path, base_oid, base_type)
-        result = base_bytes
-        metadata = self.load_metadata()
-        # apply remaining entries
+        result = load_object(self.repo_path, base_oid, "base") if base_type == "base" else load_object(self.repo_path, base_oid, base_type)
         for obj_type, oid in chain[1:]:
             if obj_type == "base":
                 result = load_object(self.repo_path, oid, "base")
             elif obj_type == "diff":
                 diff_bytes = load_object(self.repo_path, oid, "diff")
-                # detect mode
-                mode = metadata.get("commits", {}).get(commit_oid, {}).get("files", {}).get(filepath, ["text"])[0]
-                if mode == "text":
-                    result = apply_text_diff(result, diff_bytes)
-                else:
-                    result = apply_binary_diff(result, diff_bytes)
+                result = apply_text_diff(result, diff_bytes) if is_text_content(result) else apply_binary_diff(result, diff_bytes)
             else:
                 raise ValueError(f"Unsupported object type in chain: {obj_type}")
         return result
 
     # -------------------------
-    # High-level operations
+    # Staging / add
     # -------------------------
     def add(self, filepath: str):
         abs_path = os.path.join(self.working_dir, filepath)
@@ -310,9 +309,13 @@ class GibleRepository:
             self.index.add_file(rel, content_hash, mode)
             print(f"Staged: {rel} (mode: {mode})")
 
+    # -------------------------
+    # Commit
+    # -------------------------
     def commit(self, message: str):
         metadata = self.load_metadata()
         head = metadata.get("head")
+        current_branch = metadata.get("current_branch", "master")
         staged = self.index.get_all()
         if not staged:
             print("No changes staged. Nothing to commit.")
@@ -339,7 +342,7 @@ class GibleRepository:
                 last_bytes = self.reconstruct_file_bytes(head, filepath)
                 if is_text:
                     diff_bytes = generate_text_diff(last_bytes, current_bytes)
-                    if diff_bytes == b"[]":
+                    if not json.loads(diff_bytes.decode('utf-8')):
                         new_files_map[filepath] = prev_entry
                         print(f"  {filepath}: no changes (skipped)")
                     else:
@@ -364,126 +367,193 @@ class GibleRepository:
             "timestamp": datetime.now().isoformat()
         }
         commit_oid = self._write_commit_object(commit_obj)
-        print(f"[master] {message}")
+        print(f"[{current_branch}] {message}")
         print(f"  commit {commit_oid}")
         self.index.clear()
         print("Staging area cleared.")
 
-    def get_commit_tree(self, commit_oid: str) -> Dict[str, List[str]]:
-        commit = self._get_full_commit(commit_oid)
-        return commit.get("files", {})
+    # -------------------------
+    # Branching / merging
+    # -------------------------
+    def create_branch(self, name: str):
+        metadata = self.load_metadata()
+        if name in metadata['branches']:
+            print(f"Branch '{name}' already exists")
+            return
+        metadata['branches'][name] = metadata['head']
+        self.save_metadata(metadata)
+        print(f"Branch '{name}' created at {metadata['head'][:8]}")
 
-    def get_file_at_commit(self, commit_oid: str, filepath: str):
-        files_map = self.get_commit_tree(commit_oid)
-        entry = files_map.get(filepath)
-        if not entry:
-            raise FileNotFoundError(f"File '{filepath}' not found in commit '{commit_oid}'")
-        obj_type, oid = entry
-        if obj_type == "base":
-            return load_object(self.repo_path, oid, "base")
-        elif obj_type == "diff":
-            return self.reconstruct_file_bytes(commit_oid, filepath)
+    def switch_branch(self, name: str):
+        metadata = self.load_metadata()
+        if name not in metadata['branches']:
+            print(f"Branch '{name}' does not exist")
+            return
+        metadata['current_branch'] = name
+        head_commit = metadata['branches'][name]
+        if head_commit:
+            self.checkout(head_commit)
+        self.save_metadata(metadata)
+        print(f"Switched to branch '{name}'")
+
+    def merge_branch(self, other_branch: str):
+        metadata = self.load_metadata()
+        if other_branch not in metadata['branches']:
+            print(f"Branch '{other_branch}' does not exist")
+            return
+        current_branch = metadata.get("current_branch", "master")
+        current_head = metadata['branches'].get(current_branch)
+        other_head = metadata['branches'][other_branch]
+        print(f"Merging branch '{other_branch}' into '{current_branch}'")
+
+        merged_files: Dict[str, List[str]] = {}
+        files_current = self.get_commit_tree(current_head) if current_head else {}
+        files_other = self.get_commit_tree(other_head) if other_head else {}
+        all_files = set(files_current.keys()) | set(files_other.keys())
+
+        merge_oid = str(uuid.uuid4())
+        merge_dir = os.path.join(self.repo_path, "merge", merge_oid)
+        os.makedirs(merge_dir, exist_ok=True)
+        conflict_occurred = False
+
+        for f in all_files:
+            entry_curr = files_current.get(f)
+            entry_other = files_other.get(f)
+
+            if entry_curr is None:
+                merged_files[f] = entry_other
+            elif entry_other is None:
+                merged_files[f] = entry_curr
+            else:
+                type_curr, oid_curr = entry_curr
+                type_other, oid_other = entry_other
+                data_curr = self.reconstruct_file_bytes(current_head, f)
+                data_other = self.reconstruct_file_bytes(other_head, f)
+                
+                if is_text_content(data_curr) and is_text_content(data_other):
+                    if data_curr != data_other:
+                        conflict_occurred = True
+                        conflict_file = os.path.join(merge_dir, f.replace(os.sep, "_") + ".json")
+                        os.makedirs(os.path.dirname(conflict_file), exist_ok=True)
+                        conflict_json = {
+                            "file": f,
+                            "status": "conflict",
+                            "base": "",
+                            "ours": data_curr.decode("utf-8"),
+                            "theirs": data_other.decode("utf-8")
+                        }
+                        with open(conflict_file, "w", encoding="utf-8") as mf:
+                            json.dump(conflict_json, mf, indent=2, ensure_ascii=False)
+                        merged_files[f] = entry_curr
+                    else:
+                        merged_files[f] = entry_curr
+                else:
+                    if data_curr != data_other:
+                        conflict_occurred = True
+                        conflict_file = os.path.join(merge_dir, f.replace(os.sep, "_") + ".json")
+                        os.makedirs(os.path.dirname(conflict_file), exist_ok=True)
+                        conflict_json = {
+                            "file": f,
+                            "status": "conflict",
+                            "base": "",
+                            "ours": base64.b64encode(data_curr).decode("utf-8"),
+                            "theirs": base64.b64encode(data_other).decode("utf-8")
+                        }
+                        with open(conflict_file, "w", encoding="utf-8") as mf:
+                            json.dump(conflict_json, mf, indent=2, ensure_ascii=False)
+                    merged_files[f] = entry_curr
+
+        merge_commit_obj = {
+            "parent": [current_head, other_head],
+            "files": merged_files,
+            "message": f"Merge branch {other_branch} into {current_branch}",
+            "author": self.load_config().get("author", "unknown"),
+            "timestamp": datetime.now().isoformat()
+        }
+        commit_oid = self._write_commit_object(merge_commit_obj)
+
+        if conflict_occurred:
+            print(f"Merge commit created: {commit_oid}")
+            print(f"Conflicts detected! See .gible/merge/{merge_oid}/ for JSON conflict files.")
         else:
-            raise ValueError(f"Unsupported object type '{obj_type}'")
+            print(f"Merge commit created: {commit_oid} (no conflicts)")
 
-    def checkout(self, commit_oid: str, target_dir: Optional[str] = None):
-        if target_dir is None:
-            target_dir = self.working_dir
+    def get_commit_tree(self, commit_oid: Optional[str]) -> dict:
+        if not commit_oid:
+            return {}
+        commit_obj = self._get_full_commit(commit_oid)
+        return commit_obj.get("files", {})
+
+    # -------------------------
+    # Checkout
+    # -------------------------
+    def checkout(self, commit_oid: str):
         files_map = self.get_commit_tree(commit_oid)
         for filepath, entry in files_map.items():
-            full_target = os.path.join(target_dir, filepath)
-            os.makedirs(os.path.dirname(full_target), exist_ok=True)
-            content_bytes = self.get_file_at_commit(commit_oid, filepath)
-            if is_text_content(content_bytes):
-                with open(full_target, "w", encoding='utf-8', newline='') as f:
-                    f.write(content_bytes.decode('utf-8'))
+            obj_type, oid = entry
+            if obj_type == "base":
+                data = load_object(self.repo_path, oid, "base")
             else:
-                with open(full_target, "wb") as f:
-                    f.write(content_bytes)
-        metadata = self.load_metadata()
-        metadata["head"] = commit_oid
-        self.save_metadata(metadata)
-        print(f"Checked out {commit_oid[:8]}")
+                data = self.reconstruct_file_bytes(commit_oid, filepath)
+            abs_path = os.path.join(self.working_dir, filepath)
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            Path(abs_path).write_bytes(data)
+        print(f"Checked out commit {commit_oid[:8]}")
 
+    # -------------------------
+    # Status
+    # -------------------------
     def status(self):
-        if not self.is_repo():
-            print("Not a Gible repository.")
-            return
-        metadata = self.load_metadata()
-        print(f"Gible repo at {self.repo_path}")
-        print(f"HEAD: {metadata.get('head')}")
         staged = self.index.get_all()
-        if staged:
+        if not staged:
+            print("No files staged")
+        else:
             print("Staged files:")
-            for p, info in staged.items():
-                print(f"  - {p} ({info.get('mode')})")
-        else:
-            print("No files staged.")
-
-    def destroy_repo(self):
-        if os.path.exists(self.repo_path):
-            shutil.rmtree(self.repo_path)
-            print(f"Destroyed repository at {self.repo_path}")
-        else:
-            print("No repository to destroy.")
+            for f, info in staged.items():
+                print(f"  {f} ({info.get('mode')})")
 
 # -------------------------
 # CLI
 # -------------------------
-def find_repo(path: str = ".") -> Optional[GibleRepository]:
-    current = os.path.abspath(path)
-    while True:
-        candidate = GibleRepository(current)
-        if candidate.is_repo():
-            return candidate
-        parent = os.path.dirname(current)
-        if parent == current:
-            return None
-        current = parent
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python main.py <command> [args...]")
+        sys.exit(1)
 
-def usage():
-    print("Usage: python gible.py <command> [args]")
-    print("Commands: init, status, destroy, add <file>, commit -m <msg>, checkout <commit_oid>")
+    cmd = sys.argv[1]
+    repo = GibleRepository(os.getcwd())
 
-def main(argv):
-    if len(argv) < 2:
-        usage()
-        return
-
-    command = argv[1]
-
-    if command == "init":
-        GibleRepository(os.getcwd()).init()
-        return
-
-    repo = find_repo()
-    if not repo:
-        print("Error: Not a gible repository. Run 'python gible.py init' first.")
-        return
-
-    if command == "status":
+    if cmd == "init":
+        repo.init()
+    elif cmd == "add":
+        if len(sys.argv) < 3:
+            print("Usage: add <path>")
+        else:
+            repo.add(sys.argv[2])
+    elif cmd == "commit":
+        if len(sys.argv) < 3:
+            print("Usage: commit <message>")
+        else:
+            repo.commit(sys.argv[2])
+    elif cmd == "branch":
+        if len(sys.argv) < 3:
+            print("Usage: branch <name>")
+        else:
+            repo.create_branch(sys.argv[2])
+    elif cmd == "switch":
+        if len(sys.argv) < 3:
+            print("Usage: switch <branch>")
+        else:
+            repo.switch_branch(sys.argv[2])
+    elif cmd == "merge":
+        if len(sys.argv) < 3:
+            print("Usage: merge <branch>")
+        else:
+            repo.merge_branch(sys.argv[2])
+    elif cmd == "status":
         repo.status()
-    elif command == "destroy":
-        repo.destroy_repo()
-    elif command == "add":
-        if len(argv) < 3:
-            print("Usage: add <file>")
-            return
-        repo.add(argv[2])
-    elif command == "commit":
-        if len(argv) < 4 or argv[2] != "-m":
-            print('Usage: commit -m "message"')
-            return
-        repo.commit(argv[3])
-    elif command == "checkout":
-        if len(argv) < 3:
-            print("Usage: checkout <commit_oid>")
-            return
-        repo.checkout(argv[2])
     else:
-        print(f"Unknown command: {command}")
-        usage()
-
+        print(f"Unknown command: {cmd}")
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()
