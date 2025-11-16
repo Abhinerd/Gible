@@ -1,3 +1,4 @@
+import json
 import customtkinter as ctk
 from tkinter import filedialog, ttk, messagebox, Menu
 from PIL import Image, ImageTk
@@ -5,9 +6,20 @@ import os
 import time
 import shutil
 from customtkinter import CTkInputDialog
+import sys
+from pathlib import Path
 
-from ui_dialogs import RepoSelectDialog
+from ui_dialogs import RepoSelectDialog, SettingsDialog
 from vcs_core import VCSEngine
+
+def get_config_dir():
+    """Returns the OS-specific path for the app's configuration directory."""
+    if sys.platform == "win32":
+        return Path.home() / "AppData" / "Roaming" / "Gible"
+    elif sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Gible"
+    else: # Linux and others
+        return Path.home() / ".config" / "gible"
 
 class App(ctk.CTk):
     def __init__(self):
@@ -15,36 +27,34 @@ class App(ctk.CTk):
         self.title("Lightweight Version Control System"); self.geometry("1024x768")
         self.grid_rowconfigure(0, weight=1); self.grid_columnconfigure(0, weight=1)
         ctk.set_appearance_mode("System"); ctk.set_default_color_theme("blue")
-        self.base_repo_path = "/Users/abhinav/Documents/Gible/Repositories"
         
-        # State Variables
-        self.vcs = None # Will hold the VCSEngine instance
-        self.current_repo_path = None
-        self.current_display_path = None
-        self.currently_editing_file = None
+        # --- CONFIGURATION LOGIC ---
+        self.config_dir = get_config_dir()
+        self.config_path = self.config_dir / "config.json"
+        self.base_repo_path = self._load_config() # Can be None on first run
+        
+        # --- State Variables ---
+        self.vcs = None
+        # ... (rest of the state variables are the same)
+        self.current_repo_path = None; self.current_display_path = None; self.currently_editing_file = None
         self.undo_stack = []; self.redo_stack = []
 
         try:
+            # Assumes you have an 'images' folder in your project root
             self.folder_icon = ImageTk.PhotoImage(Image.open("images/folder.png").resize((20, 20)))
             self.file_icon = ImageTk.PhotoImage(Image.open("images/file.png").resize((20, 20)))
         except FileNotFoundError: self.folder_icon = self.file_icon = None
         
+        # ... (rest of the __init__ method is the same)
         container = ctk.CTkFrame(self, corner_radius=0); container.pack(side="top", fill="both", expand=True)
         container.grid_rowconfigure(0, weight=1); container.grid_columnconfigure(0, weight=1)
-        
         self.frames = {}
         self.welcome_frame = ctk.CTkFrame(container); self.repo_frame = ctk.CTkFrame(container)
         self.commit_view_frame = ctk.CTkFrame(container); self.history_view_frame = ctk.CTkFrame(container)
         self.frames["welcome"] = self.welcome_frame; self.frames["repository"] = self.repo_frame
         self.frames["commit"] = self.commit_view_frame; self.frames["history"] = self.history_view_frame
-
-        for frame in self.frames.values():
-            frame.grid(row=0, column=0, sticky="nsew")
-
-        self.populate_welcome_frame()
-        self.populate_repo_frame()
-        self.show_frame("welcome")
-        
+        for frame in self.frames.values(): frame.grid(row=0, column=0, sticky="nsew")
+        self.populate_welcome_frame(); self.populate_repo_frame(); self.show_frame("welcome")
         self.bind("<Command-s>", self.shortcut_save); self.bind("<Control-s>", self.shortcut_save)
 
     def populate_welcome_frame(self):
@@ -52,6 +62,13 @@ class App(ctk.CTk):
         self.welcome_label.pack(pady=20, padx=20)
         ctk.CTkButton(self.welcome_frame, text="Create New Repository", command=self.create_repository_action).pack(pady=10, padx=20)
         ctk.CTkButton(self.welcome_frame, text="Open Existing Repository", command=self.open_repository_action).pack(pady=10, padx=20)
+
+        self.settings_button = ctk.CTkButton(
+            self.welcome_frame, text="Settings",
+            command=self.open_settings,
+            width=100
+        )
+        self.settings_button.pack(side="bottom", anchor="se", padx=10, pady=10)
 
     def populate_repo_frame(self):
         self.repo_frame.grid_columnconfigure(1, weight=1); self.repo_frame.grid_rowconfigure(0, weight=1)
@@ -374,7 +391,12 @@ class App(ctk.CTk):
         for item in self.tree.get_children(): self.tree.delete(item)
         
     def create_repository_action(self):
-        dialog = CTkInputDialog(text="Enter the name for the new repository:", title="Create Repository"); repo_name = dialog.get_input()
+        if not self._handle_first_run_setup():
+            return # Abort if user cancels setup
+
+        dialog = CTkInputDialog(text="Enter the name for the new repository:", title="Create Repository")
+        # ... (rest of the function is the same as before)
+        repo_name = dialog.get_input()
         if not repo_name or not repo_name.strip(): return
         try: os.makedirs(self.base_repo_path, exist_ok=True)
         except OSError as e: messagebox.showerror("Error", f"Could not access base directory:\n{self.base_repo_path}\n\nError: {e}"); return
@@ -385,7 +407,11 @@ class App(ctk.CTk):
             except Exception as e: messagebox.showerror("Error", f"Could not create repository folder.\n\nError: {e}")
             
     def open_repository_action(self):
+        if not self._handle_first_run_setup():
+            return # Abort if user cancels setup
+
         try:
+            # ... (rest of the function is the same as before)
             if not os.path.isdir(self.base_repo_path): messagebox.showinfo("Information", "Repository directory doesn't exist yet."); return
             repo_list = [d for d in os.listdir(self.base_repo_path) if os.path.isdir(os.path.join(self.base_repo_path, d))]
             if not repo_list: messagebox.showinfo("Information", "No existing repositories found."); return
@@ -424,6 +450,52 @@ class App(ctk.CTk):
             parent_path = os.path.dirname(self.current_display_path)
             self.current_display_path = parent_path
             self.populate_treeview(self.current_display_path)
+
+    def _load_config(self):
+        """Loads the workspace path from the config file. Returns None if not found."""
+        if self.config_path.exists():
+            try:
+                with open(self.config_path, 'r') as f:
+                    config = json.load(f)
+                    return config.get("repository_workspace")
+            except (json.JSONDecodeError, KeyError):
+                return None
+        return None
+
+    def _save_config(self):
+        """Saves the current base_repo_path to the config file."""
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        config = {"repository_workspace": self.base_repo_path}
+        with open(self.config_path, 'w') as f:
+            json.dump(config, f, indent=4)
+
+    def _handle_first_run_setup(self):
+        """Prompts the user to select a workspace. Returns True on success."""
+        if self.base_repo_path:
+            return True # Setup already done
+        
+        messagebox.showinfo("Welcome!", "Please select a folder to store your repositories.")
+        chosen_path = filedialog.askdirectory(title="Select Your Repositories Workspace")
+        if chosen_path:
+            self.base_repo_path = chosen_path
+            self._save_config()
+            return True
+        else: # User cancelled
+            return False
+
+    def open_settings(self):
+        """Opens the settings dialog to change the workspace."""
+        # Ensure we have a path before opening settings
+        if not self._handle_first_run_setup():
+            return
+            
+        dialog = SettingsDialog(self, current_workspace=self.base_repo_path)
+        new_path = dialog.get_new_path()
+
+        if new_path and new_path != self.base_repo_path:
+            self.base_repo_path = new_path
+            self._save_config()
+            messagebox.showinfo("Settings Updated", f"Your repository workspace has been changed to:\n{new_path}")
 
 if __name__ == "__main__":
     app = App()
