@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gible Phase-3: Branching + safe merge
+Gible CLI
 
 Features:
 - Text files: line-based diffs (SequenceMatcher)
