@@ -384,17 +384,40 @@ class GibleRepository:
         self.save_metadata(metadata)
         print(f"Branch '{name}' created at {metadata['head'][:8]}")
 
-    def switch_branch(self, name: str):
+    def switch_branch(self, name: str, silent: bool = False):
         metadata = self.load_metadata()
         if name not in metadata['branches']:
-            print(f"Branch '{name}' does not exist")
+            if not silent: print(f"Branch '{name}' does not exist")
             return
         metadata['current_branch'] = name
         head_commit = metadata['branches'][name]
         if head_commit:
             self.checkout(head_commit)
         self.save_metadata(metadata)
-        print(f"Switched to branch '{name}'")
+        if not silent: print(f"Switched to branch '{name}'")
+        
+    def merge_lines(self, base: List[str], ours: List[str], theirs: List[str]) -> Tuple[List[str], bool]:
+        """
+        Simple 3-way line merge.
+        Returns (merged_lines, conflict_flag)
+        """
+        merged = []
+        conflict = False
+        max_len = max(len(base), len(ours), len(theirs))
+        for i in range(max_len):
+            b = base[i] if i < len(base) else None
+            o = ours[i] if i < len(ours) else None
+            t = theirs[i] if i < len(theirs) else None
+
+            if o == t or o == b:
+                merged.append(t if t is not None else o)
+            elif t == b:
+                merged.append(o)
+            elif o != t:
+                # Conflict on this line
+                merged.append(o)  # Or you can add markers here if you want
+                conflict = True
+        return merged, conflict
 
     def merge_branch(self, other_branch: str):
         metadata = self.load_metadata()
@@ -431,22 +454,34 @@ class GibleRepository:
                 data_other = self.reconstruct_file_bytes(other_head, f)
                 
                 if is_text_content(data_curr) and is_text_content(data_other):
-                    if data_curr != data_other:
+                    # Load base if exists, else empty
+                    base_bytes = b""
+                    # Try to find base from common ancestor commit if you want,
+                    # otherwise leave empty for simple merges
+                    base_lines = base_bytes.decode("utf-8").splitlines(keepends=True)
+                    ours_lines = data_curr.decode("utf-8").splitlines(keepends=True)
+                    theirs_lines = data_other.decode("utf-8").splitlines(keepends=True)
+
+                    merged_lines, conflict_flag = self.merge_lines(base_lines, ours_lines, theirs_lines)
+
+                    merged_bytes = "".join(merged_lines).encode("utf-8")
+                    merged_oid = save_object(self.repo_path, merged_bytes, "base")
+                    merged_files[f] = ["base", merged_oid]
+
+                    if conflict_flag:
                         conflict_occurred = True
                         conflict_file = os.path.join(merge_dir, f.replace(os.sep, "_") + ".json")
                         os.makedirs(os.path.dirname(conflict_file), exist_ok=True)
                         conflict_json = {
                             "file": f,
                             "status": "conflict",
-                            "base": "",
-                            "ours": data_curr.decode("utf-8"),
-                            "theirs": data_other.decode("utf-8")
+                            "base": "".join(base_lines),
+                            "ours": "".join(ours_lines),
+                            "theirs": "".join(theirs_lines)
                         }
                         with open(conflict_file, "w", encoding="utf-8") as mf:
                             json.dump(conflict_json, mf, indent=2, ensure_ascii=False)
-                        merged_files[f] = entry_curr
-                    else:
-                        merged_files[f] = entry_curr
+
                 else:
                     if data_curr != data_other:
                         conflict_occurred = True
@@ -477,6 +512,8 @@ class GibleRepository:
             print(f"Conflicts detected! See .gible/merge/{merge_oid}/ for JSON conflict files.")
         else:
             print(f"Merge commit created: {commit_oid} (no conflicts)")
+            self.switch_branch(current_branch, silent=True)
+            
 
     def get_commit_tree(self, commit_oid: Optional[str]) -> dict:
         if not commit_oid:
