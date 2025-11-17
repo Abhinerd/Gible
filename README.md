@@ -1,4 +1,4 @@
-![Project Gible Banner](images/gible-banner.png)
+![Project Gible Banner](images/gible-banner-transparent.png)
 # Gible VCS
 ### A Lightweight Offline Version Control System
 
