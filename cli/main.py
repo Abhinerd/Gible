@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Gible CLI (fixed 3-way merge + test)
+Gible CLI (fixed deletion handling + 3-way merge + test)
 
-- Proper ancestor detection (reachability)
-- Proper 3-way merge using real common ancestor (merge base)
-- Conflict markers written into working tree for text conflicts
-- JSON conflict details saved in .gible/merge/<id>/
-- Prompt when conflicts occur to force commit or cancel
-- Test function `test-merge` to exercise a same-line conflict case
+Changes made:
+- Properly record deletions in commit() as ["deleted", None]
+- reconstruct_file_bytes() returns None when a file was deleted in history
+- merge_branch() respects deletion rules (delete wins, or conflict when one side deletes and the other modifies)
+- checkout() renamed to restore_commit() and properly removes deleted files
+- switch_branch() updated to call restore_commit()
+- commit() treats a previous "deleted" as no previous content (stores base)
+- Minor helpers unchanged except adjusted to work with deletion semantics
 """
 from __future__ import annotations
 import os
@@ -177,7 +179,7 @@ class GibleRepository:
             return False
         os.makedirs(self.objects_path, exist_ok=True)
         initial_config = {
-            "version": "0.4.0-merge-conflict-fixed",
+            "version": "0.5.0-deletion-support",
             "created_at": datetime.now().isoformat(),
             "author": os.getenv("USER") or os.getenv("USERNAME") or "unknown"
         }
@@ -255,8 +257,16 @@ class GibleRepository:
     # -------------------------
     # File reconstruction
     # -------------------------
-    def reconstruct_file_bytes(self, commit_oid: str, filepath: str) -> bytes:
-        chain: List[Tuple[str, str]] = []
+    def reconstruct_file_bytes(self, commit_oid: str, filepath: str) -> Optional[bytes]:
+        """
+        Walk back from commit_oid through parents collecting chain entries for filepath.
+        Returns:
+          - bytes: reconstructed content
+          - None: file was deleted (deleted entry encountered)
+        Raises:
+          - FileNotFoundError: file never present in history reachable from commit_oid
+        """
+        chain: List[Tuple[str, Optional[str]]] = []
         current_oid = commit_oid
         while current_oid:
             commit_obj = self._get_full_commit(current_oid)
@@ -266,15 +276,23 @@ class GibleRepository:
                 chain.append((entry[0], entry[1]))
             parent = commit_obj.get("parent")
             if isinstance(parent, list):
-                parent = parent[0]  # for merge commits, pick first parent for content chain
+                parent = parent[0]  # for reconstruction choose first parent
             current_oid = parent
         if not chain:
             raise FileNotFoundError(f"File '{filepath}' not present in commit {commit_oid}")
+        # chain holds history from newest->oldest; reverse to apply from base forward
         chain.reverse()
         base_type, base_oid = chain[0]
+        # If the first entry is a deletion, file was deleted in the oldest recorded entry -> treat as deleted
+        if base_type == "deleted":
+            return None
+        # load base content
         result = load_object(self.repo_path, base_oid, "base") if base_type == "base" else load_object(self.repo_path, base_oid, base_type)
         for obj_type, oid in chain[1:]:
-            if obj_type == "base":
+            if obj_type == "deleted":
+                # deletion recorded later in history -> file removed
+                return None
+            elif obj_type == "base":
                 result = load_object(self.repo_path, oid, "base")
             elif obj_type == "diff":
                 diff_bytes = load_object(self.repo_path, oid, "diff")
@@ -318,14 +336,34 @@ class GibleRepository:
         head = metadata.get("head")
         current_branch = metadata.get("current_branch", "master")
         staged = self.index.get_all()
-        if not staged:
-            print("No changes staged. Nothing to commit.")
+
+        # Automatically detect previously tracked files that are now missing on disk
+        previously_tracked_files = set()
+        if head:
+            previously_tracked_files = set(self.get_commit_tree(head).keys())
+        missing_files = {f for f in previously_tracked_files if not os.path.exists(os.path.join(self.working_dir, f))}
+
+        # Combine staged files + missing files
+        combined_files = staged.copy()
+        for f in missing_files:
+            if f not in combined_files:
+                combined_files[f] = {"mode": "text"}  # mode doesn't matter, it's deleted
+
+        if not combined_files:
+            print("No changes staged or detected. Nothing to commit.")
             return
-        new_files_map: Dict[str, List[str]] = {}
-        for filepath, info in staged.items():
+
+        new_files_map: Dict[str, List[Optional[str]]] = {}
+        for filepath, info in combined_files.items():
             abs_path = os.path.join(self.working_dir, filepath)
+
+            # ---- handle deleted file on disk: record deletion ----
             if not os.path.exists(abs_path):
+                new_files_map[filepath] = ["deleted", None]
+                print(f"  {filepath}: deleted")
                 continue
+
+            # file exists on disk -> normal processing
             current_bytes = Path(abs_path).read_bytes()
             is_text = (info.get("mode") == "text")
             prev_entry = None
@@ -335,12 +373,26 @@ class GibleRepository:
                     prev_entry = full_commit.get("files", {}).get(filepath)
                 except FileNotFoundError:
                     prev_entry = None
+
+            # if no previous recorded entry -> store base
             if prev_entry is None:
                 oid = save_object(self.repo_path, current_bytes, "base")
                 new_files_map[filepath] = ["base", oid]
                 print(f"  {filepath}: stored base ({oid[:8]})")
             else:
-                last_bytes = self.reconstruct_file_bytes(head, filepath)
+                # reconstruct last content; reconstruct may return None if file was deleted in history
+                try:
+                    last_bytes = self.reconstruct_file_bytes(head, filepath)
+                except FileNotFoundError:
+                    last_bytes = None
+
+                # treat last_bytes None as "no previous content" (store base)
+                if last_bytes is None:
+                    oid = save_object(self.repo_path, current_bytes, "base")
+                    new_files_map[filepath] = ["base", oid]
+                    print(f"  {filepath}: stored base ({oid[:8]})")
+                    continue
+
                 if is_text:
                     diff_bytes = generate_text_diff(last_bytes, current_bytes)
                     if not json.loads(diff_bytes.decode('utf-8')):
@@ -360,6 +412,7 @@ class GibleRepository:
                         oid = save_object(self.repo_path, current_bytes, "base")
                         new_files_map[filepath] = ["base", oid]
                         print(f"  {filepath}: stored binary base ({oid[:8]})")
+
         commit_obj = {
             "parent": head,
             "files": new_files_map,
@@ -373,6 +426,7 @@ class GibleRepository:
         self.index.clear()
         print("Staging area cleared.")
 
+
     # -------------------------
     # Branch utilities / ancestors
     # -------------------------
@@ -383,7 +437,7 @@ class GibleRepository:
             return
         metadata['branches'][name] = metadata['head']
         self.save_metadata(metadata)
-        print(f"Branch '{name}' created at {metadata['head'][:8]}")
+        print(f"Branch '{name}' created at {metadata['head'][:8] if metadata['head'] else 'None'}")
 
     def switch_branch(self, name: str, silent: bool = False):
         metadata = self.load_metadata()
@@ -392,13 +446,13 @@ class GibleRepository:
             return
         metadata['current_branch'] = name
         head_commit = metadata['branches'][name]
-        
-        # Update the main HEAD to point to the tip of the switched-to branch
-        metadata['head'] = head_commit 
-        
+
+        # Update main HEAD to point to branch tip
+        metadata['head'] = head_commit
+
         if head_commit:
-            self.checkout(head_commit)
-            
+            self.restore_commit(head_commit)
+
         self.save_metadata(metadata)
         if not silent: print(f"Switched to branch '{name}'")
 
@@ -440,7 +494,6 @@ class GibleRepository:
         if not oid1 or not oid2:
             return None
         anc1 = self._all_ancestors(oid1)
-        # BFS/DFS from oid2 and stop when one is in anc1
         q = [oid2]
         visited = set()
         while q:
@@ -469,18 +522,6 @@ class GibleRepository:
     # 3-way text merge helper
     # -------------------------
     def three_way_merge_text(self, base_lines: List[str], ours_lines: List[str], theirs_lines: List[str]) -> Tuple[str, bool]:
-        """
-        Merge lines using base as reference.
-        Returns (merged_text, conflict_flag). Conflict blocks include markers.
-        Algorithm:
-          - Compute edit opcodes of ours vs base and theirs vs base using SequenceMatcher.
-          - Build boundary segments across base and decide for each segment:
-              * if unchanged on both -> keep base
-              * if changed on one side only -> take changed side
-              * if changed on both:
-                  - if changed contents equal -> take it
-                  - else -> create conflict block with markers
-        """
         sm_ours = SequenceMatcher(None, base_lines, ours_lines)
         sm_theirs = SequenceMatcher(None, base_lines, theirs_lines)
 
@@ -525,12 +566,10 @@ class GibleRepository:
             elif ours_seg is None and theirs_seg is not None:
                 result_lines.extend(theirs_seg)
             else:
-                # both modified
                 if ours_seg == theirs_seg:
                     result_lines.extend(ours_seg)
                 else:
                     conflict = True
-                    # write conflict block with markers
                     result_lines.append("<<<<<<< HEAD\n")
                     result_lines.extend(ours_seg)
                     result_lines.append("=======\n")
@@ -551,14 +590,11 @@ class GibleRepository:
         current_head = metadata['branches'].get(current_branch)
         other_head = metadata['branches'][other_branch]
 
-        # quick checks
         if current_head == other_head:
             print("Already up-to-date.")
             return
 
-        # ancestor-based decisions
         if other_head and self._is_ancestor(other_head, current_head):
-            # other is ancestor of current -> already included
             try:
                 commit_obj = self._get_full_commit(other_head)
                 msg = commit_obj.get("message", "<no message>")
@@ -569,16 +605,14 @@ class GibleRepository:
             return
 
         if current_head and self._is_ancestor(current_head, other_head):
-            # fast-forward
             print(f"Fast-forwarding '{current_branch}' to '{other_branch}'...")
-            self.checkout(other_head)
+            self.restore_commit(other_head)
             metadata['branches'][current_branch] = other_head
             metadata['head'] = other_head
             self.save_metadata(metadata)
             print(f"Fast-forwarded {current_branch} -> {other_head[:8]}")
             return
 
-        # find merge base
         base_head = self._find_common_ancestor(current_head, other_head)
         print(f"Merging '{other_branch}' ({other_head[:8] if other_head else 'None'}) into '{current_branch}' ({current_head[:8] if current_head else 'None'})")
         print(f"Common ancestor: {base_head[:8] if base_head else 'None'}")
@@ -596,115 +630,125 @@ class GibleRepository:
             shutil.rmtree(merge_dir)
         os.makedirs(merge_dir, exist_ok=True)
 
-        merged_files: Dict[str, List[str]] = {}
+        merged_files: Dict[str, List[Optional[str]]] = {}
 
         for f in all_files:
-            # reconstruct three versions if present
-            base_bytes = None
-            ours_bytes = None
-            theirs_bytes = None
+            base_entry = files_base.get(f)
+            ours_entry = files_current.get(f)
+            theirs_entry = files_other.get(f)
 
-            if f in files_base:
+            # Determine deletion presence quickly from entries
+            base_deleted = (base_entry is not None and base_entry[0] == "deleted")
+            ours_deleted = (ours_entry is not None and ours_entry[0] == "deleted")
+            theirs_deleted = (theirs_entry is not None and theirs_entry[0] == "deleted")
+
+            # reconstruct bytes (None signals deleted)
+            try:
+                base_bytes = None if base_entry is None else (None if base_entry[0] == "deleted" else (load_object(self.repo_path, base_entry[1], "base") if base_entry[0] == "base" else self.reconstruct_file_bytes(base_head, f)))
+            except Exception:
+                base_bytes = None
+            try:
+                ours_bytes = None if ours_entry is None else (None if ours_entry[0] == "deleted" else self.reconstruct_file_bytes(current_head, f))
+            except Exception:
+                ours_bytes = None
+            try:
+                theirs_bytes = None if theirs_entry is None else (None if theirs_entry[0] == "deleted" else self.reconstruct_file_bytes(other_head, f))
+            except Exception:
+                theirs_bytes = None
+
+            # HANDLE: both deleted or absent
+            if (ours_entry is None or ours_bytes is None) and (theirs_entry is None or theirs_bytes is None):
+                # both deleted/absent -> omit from merged_files (deletion wins)
+                # ensure file removed from working tree
                 try:
-                    base_entry = files_base[f]
-                    if base_entry[0] == "base":
-                        base_bytes = load_object(self.repo_path, base_entry[1], "base")
-                    else:
-                        base_bytes = self.reconstruct_file_bytes(base_head, f)
+                    target = os.path.join(self.working_dir, f)
+                    if os.path.exists(target): os.remove(target)
                 except Exception:
-                    base_bytes = None
-
-            if f in files_current:
-                try:
-                    ours_bytes = self.reconstruct_file_bytes(current_head, f)
-                except Exception:
-                    ours_bytes = None
-
-            if f in files_other:
-                try:
-                    theirs_bytes = self.reconstruct_file_bytes(other_head, f)
-                except Exception:
-                    theirs_bytes = None
-
-            # deletion cases
-            if ours_bytes is None and theirs_bytes is None:
-                # not present in either side — skip
+                    pass
                 continue
-            if ours_bytes is None:
-                # we deleted
+
+            # CASE: ours deleted, theirs not
+            if (ours_entry is None or ours_bytes is None) and (theirs_entry is not None and theirs_bytes is not None):
+                # If theirs didn't change relative to base -> deletion wins
                 if base_bytes is not None and theirs_bytes == base_bytes:
-                    # they didn't change -> deletion wins
-                    if os.path.exists(os.path.join(self.working_dir, f)): os.remove(os.path.join(self.working_dir, f))
-                    # file omitted from merged_files (deletion)
+                    # deletion wins -> remove file
+                    try:
+                        t = os.path.join(self.working_dir, f)
+                        if os.path.exists(t): os.remove(t)
+                    except Exception:
+                        pass
                     continue
                 else:
                     # conflict: deleted by us, modified by them
                     conflict_occurred = True
                     conflict_file = os.path.join(merge_dir, f.replace(os.sep, "_") + ".json")
                     os.makedirs(os.path.dirname(conflict_file), exist_ok=True)
-                    conflict_json = {"file": f, "status": "conflict", "base": base64.b64encode(base_bytes).decode() if base_bytes else None, "ours": None, "theirs": base64.b64encode(theirs_bytes).decode() if theirs_bytes else None}
+                    conflict_json = {"file": f, "status": "conflict", "base": base_bytes.decode('utf-8') if base_bytes and is_text_content(base_bytes) else (base64.b64encode(base_bytes).decode() if base_bytes else None), "ours": None, "theirs": theirs_bytes.decode('utf-8') if theirs_bytes and is_text_content(theirs_bytes) else (base64.b64encode(theirs_bytes).decode() if theirs_bytes else None)}
                     with open(conflict_file, "w", encoding="utf-8") as mf:
                         json.dump(conflict_json, mf, indent=2, ensure_ascii=False)
-                    # write theirs with conflict marker? choose to keep theirs content in working tree for now:
+                    # keep theirs in working tree for manual resolution
                     if theirs_bytes is not None:
                         Path(os.path.join(self.working_dir, f)).write_bytes(theirs_bytes)
                         merged_files[f] = ["base", save_object(self.repo_path, theirs_bytes, "base")]
                     continue
 
-            if theirs_bytes is None:
-                # they deleted
+            # CASE: theirs deleted, ours not
+            if (theirs_entry is None or theirs_bytes is None) and (ours_entry is not None and ours_bytes is not None):
+                # If ours didn't change relative to base -> deletion wins
                 if base_bytes is not None and ours_bytes == base_bytes:
-                    # we didn't change -> deletion wins
-                    if os.path.exists(os.path.join(self.working_dir, f)): os.remove(os.path.join(self.working_dir, f))
+                    try:
+                        t = os.path.join(self.working_dir, f)
+                        if os.path.exists(t): os.remove(t)
+                    except Exception:
+                        pass
                     continue
                 else:
                     # conflict: modified by us, deleted by them
                     conflict_occurred = True
                     conflict_file = os.path.join(merge_dir, f.replace(os.sep, "_") + ".json")
                     os.makedirs(os.path.dirname(conflict_file), exist_ok=True)
-                    conflict_json = {"file": f, "status": "conflict", "base": base64.b64encode(base_bytes).decode() if base_bytes else None, "ours": base64.b64encode(ours_bytes).decode() if ours_bytes else None, "theirs": None}
-                    with open(conflict_file, "w", encoding="utf-8") as mf:
-                        json.dump(conflict_json, mf, indent=2, ensure_ascii=False)
-                    # keep ours for working tree
-                    Path(os.path.join(self.working_dir, f)).write_bytes(ours_bytes)
-                    merged_files[f] = ["base", save_object(self.repo_path, ours_bytes, "base")]
-                    continue
-
-            # both exist -> handle text vs binary
-            if is_text_content(ours_bytes) and is_text_content(theirs_bytes):
-                base_lines = base_bytes.decode("utf-8").splitlines(keepends=True) if base_bytes is not None else []
-                ours_lines = ours_bytes.decode("utf-8").splitlines(keepends=True)
-                theirs_lines = theirs_bytes.decode("utf-8").splitlines(keepends=True)
-
-                merged_text, local_conflict = self.three_way_merge_text(base_lines, ours_lines, theirs_lines)
-                merged_bytes = merged_text.encode("utf-8")
-                if local_conflict:
-                    conflict_occurred = True
-                    # write JSON conflict summary
-                    conflict_file = os.path.join(merge_dir, f.replace(os.sep, "_") + ".json")
-                    os.makedirs(os.path.dirname(conflict_file), exist_ok=True)
-                    conflict_json = {"file": f, "status": "conflict", "base": "".join(base_lines), "ours": "".join(ours_lines), "theirs": "".join(theirs_lines)}
-                    with open(conflict_file, "w", encoding="utf-8") as mf:
-                        json.dump(conflict_json, mf, indent=2, ensure_ascii=False)
-                # write merged content with markers (if any) into working tree
-                Path(os.path.join(self.working_dir, f)).write_bytes(merged_bytes)
-                merged_files[f] = ["base", save_object(self.repo_path, merged_bytes, "base")]
-            else:
-                # binary or mixed: if equal -> ok; if different -> conflict, choose ours but mark conflict
-                if ours_bytes == theirs_bytes:
-                    merged_files[f] = ["base", save_object(self.repo_path, ours_bytes, "base")]
-                else:
-                    conflict_occurred = True
-                    conflict_file = os.path.join(merge_dir, f.replace(os.sep, "_") + ".json")
-                    os.makedirs(os.path.dirname(conflict_file), exist_ok=True)
-                    conflict_json = {"file": f, "status": "conflict", "base": base64.b64encode(base_bytes).decode() if base_bytes else None, "ours": base64.b64encode(ours_bytes).decode(), "theirs": base64.b64encode(theirs_bytes).decode()}
+                    conflict_json = {"file": f, "status": "conflict", "base": base_bytes.decode('utf-8') if base_bytes and is_text_content(base_bytes) else (base64.b64encode(base_bytes).decode() if base_bytes else None), "ours": ours_bytes.decode('utf-8') if ours_bytes and is_text_content(ours_bytes) else (base64.b64encode(ours_bytes).decode() if ours_bytes else None), "theirs": None}
                     with open(conflict_file, "w", encoding="utf-8") as mf:
                         json.dump(conflict_json, mf, indent=2, ensure_ascii=False)
                     # keep ours in working tree
-                    Path(os.path.join(self.working_dir, f)).write_bytes(ours_bytes)
-                    merged_files[f] = ["base", save_object(self.repo_path, ours_bytes, "base")]
+                    if ours_bytes is not None:
+                        Path(os.path.join(self.working_dir, f)).write_bytes(ours_bytes)
+                        merged_files[f] = ["base", save_object(self.repo_path, ours_bytes, "base")]
+                    continue
 
-        # If conflicts occurred: prompt user to force or cancel
+            # BOTH SIDES HAVE CONTENT -> normal merge
+            if ours_bytes is not None and theirs_bytes is not None:
+                if is_text_content(ours_bytes) and is_text_content(theirs_bytes):
+                    base_lines = base_bytes.decode("utf-8").splitlines(keepends=True) if base_bytes is not None else []
+                    ours_lines = ours_bytes.decode("utf-8").splitlines(keepends=True)
+                    theirs_lines = theirs_bytes.decode("utf-8").splitlines(keepends=True)
+
+                    merged_text, local_conflict = self.three_way_merge_text(base_lines, ours_lines, theirs_lines)
+                    merged_bytes = merged_text.encode("utf-8")
+                    if local_conflict:
+                        conflict_occurred = True
+                        conflict_file = os.path.join(merge_dir, f.replace(os.sep, "_") + ".json")
+                        os.makedirs(os.path.dirname(conflict_file), exist_ok=True)
+                        conflict_json = {"file": f, "status": "conflict", "base": "".join(base_lines), "ours": "".join(ours_lines), "theirs": "".join(theirs_lines)}
+                        with open(conflict_file, "w", encoding="utf-8") as mf:
+                            json.dump(conflict_json, mf, indent=2, ensure_ascii=False)
+                    Path(os.path.join(self.working_dir, f)).write_bytes(merged_bytes)
+                    merged_files[f] = ["base", save_object(self.repo_path, merged_bytes, "base")]
+                else:
+                    # binary or mixed
+                    if ours_bytes == theirs_bytes:
+                        merged_files[f] = ["base", save_object(self.repo_path, ours_bytes, "base")]
+                    else:
+                        conflict_occurred = True
+                        conflict_file = os.path.join(merge_dir, f.replace(os.sep, "_") + ".json")
+                        os.makedirs(os.path.dirname(conflict_file), exist_ok=True)
+                        conflict_json = {"file": f, "status": "conflict", "base": base64.b64encode(base_bytes).decode() if base_bytes else None, "ours": base64.b64encode(ours_bytes).decode(), "theirs": base64.b64encode(theirs_bytes).decode()}
+                        with open(conflict_file, "w", encoding="utf-8") as mf:
+                            json.dump(conflict_json, mf, indent=2, ensure_ascii=False)
+                        Path(os.path.join(self.working_dir, f)).write_bytes(ours_bytes)
+                        merged_files[f] = ["base", save_object(self.repo_path, ours_bytes, "base")]
+
+        # If conflicts occurred: prompt user
         if conflict_occurred:
             print("\nAutomatic merge produced conflicts.")
             print(f"Conflict details saved under: {merge_dir}")
@@ -734,7 +778,7 @@ class GibleRepository:
         print(f"Updated {current_branch} -> {commit_oid[:8]}")
 
     # -------------------------
-    # Helpers: commit tree, checkout
+    # Helpers: commit tree, restore (was checkout)
     # -------------------------
     def get_commit_tree(self, commit_oid: Optional[str]) -> dict:
         if not commit_oid:
@@ -745,7 +789,11 @@ class GibleRepository:
         except FileNotFoundError:
             return {}
 
-    def checkout(self, commit_oid: str):
+    def restore_commit(self, commit_oid: str):
+        """
+        Restore (rollback) working directory to match commit_oid.
+        Handles 'deleted' entries by removing files from disk.
+        """
         files_map = self.get_commit_tree(commit_oid)
 
         # Determine currently tracked files (from current HEAD in metadata)
@@ -767,7 +815,7 @@ class GibleRepository:
                         os.remove(abs_path)
                     except Exception:
                         pass
-                    # try removing empty parent directories (but don't climb out of working dir)
+                    # try removing empty parent directories
                     parent = os.path.dirname(abs_path)
                     while parent and parent != self.working_dir and parent.startswith(self.working_dir):
                         try:
@@ -779,17 +827,45 @@ class GibleRepository:
                             break
                         parent = os.path.dirname(parent)
 
-        # Write files from commit (overwrites existing or creates new)
+        # Write files from commit (overwrites existing or creates new; handles 'deleted')
         for filepath, entry in files_map.items():
-            obj_type, oid = entry
+            obj_type, oid = entry[0], entry[1]
+
+            abs_path = os.path.join(self.working_dir, filepath)
+            # Create parent dirs
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+
+            if obj_type == "deleted":
+                # ensure file removed
+                if os.path.exists(abs_path):
+                    try:
+                        os.remove(abs_path)
+                    except Exception:
+                        pass
+                continue
+
             if obj_type == "base":
                 data = load_object(self.repo_path, oid, "base")
-            else:
-                data = self.reconstruct_file_bytes(commit_oid, filepath)
-            abs_path = os.path.join(self.working_dir, filepath)
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            Path(abs_path).write_bytes(data)
-        print(f"Checked out commit {commit_oid[:8]}")
+                Path(abs_path).write_bytes(data)
+                continue
+
+            if obj_type == "diff":
+                try:
+                    data = self.reconstruct_file_bytes(commit_oid, filepath)
+                except FileNotFoundError:
+                    data = None
+                if data is None:
+                    # resolved to deletion
+                    if os.path.exists(abs_path):
+                        try:
+                            os.remove(abs_path)
+                        except Exception:
+                            pass
+                else:
+                    Path(abs_path).write_bytes(data)
+                continue
+
+        print(f"Restored commit {commit_oid[:8]}")
 
     # -------------------------
     # Status
@@ -824,8 +900,40 @@ class GibleRepository:
         else:
             print("Destroy operation cancelled.")
 
+    # -------------------------
+    # Convenience: branches & logs
+    # -------------------------
+    def list_branches(self):
+        metadata = self.load_metadata()
+        current = metadata.get("current_branch")
+        print("Branches:")
+        for name, oid in metadata["branches"].items():
+            mark = "*" if name == current else " "
+            short = oid[:8] if oid else "None"
+            print(f"{mark} {name} ({short})")
+
+    def log_current_branch(self):
+        metadata = self.load_metadata()
+        head = metadata.get("head")
+        if not head:
+            print("No commits yet.")
+            return
+
+        current = self.load_metadata().get('current_branch')
+        print(f"Commit history of branch {current}:")
+
+        while head:
+            c = self._get_full_commit(head)
+            msg = c.get("message", "")
+            ts = c.get("timestamp", "")
+            print(f"{head}\n  {ts}\n  {msg}\n")
+            parent = c.get("parent")
+            if isinstance(parent, list):
+                parent = parent[0]
+            head = parent
+
 # -------------------------
-# Test helper: construct repo & cause a same-line conflict
+# Test helper: construct repo & cause a same-line conflict + deletion test
 # -------------------------
 def run_merge_conflict_test():
     tmp = tempfile.mkdtemp(prefix="gible-test-")
@@ -835,7 +943,9 @@ def run_merge_conflict_test():
 
     # write base file and commit on master
     Path(os.path.join(tmp, "1.txt")).write_text("line1\nline2\nline3\n", encoding="utf-8")
+    Path(os.path.join(tmp, "to_delete.txt")).write_text("delete me\n", encoding="utf-8")
     repo.add("1.txt")
+    repo.add("to_delete.txt")
     repo.commit("base commit")
 
     # create branch 'feature'
@@ -846,11 +956,14 @@ def run_merge_conflict_test():
     repo.add("1.txt")
     repo.commit("feature edits")
 
-    # switch back to master and make a conflicting edit and commit
+    # switch back to master and make a conflicting edit and commit and delete a file
     repo.switch_branch("master")
     Path(os.path.join(tmp, "1.txt")).write_text("line1\nmaster-modified-line2\nline3\n", encoding="utf-8")
+    os.remove(os.path.join(tmp, "to_delete.txt"))  # delete file on disk
     repo.add("1.txt")
-    repo.commit("master edits")
+    # stage deletion by leaving to_delete.txt in index but absent on disk:
+    # (index still has it from initial add; commit() will detect file missing and record deletion)
+    repo.commit("master edits (and deletion)")
 
     # merge feature into master: should detect conflict
     print("\n=== Now merging 'feature' into 'master' (expected conflict) ===")
@@ -869,16 +982,18 @@ def main():
     if len(sys.argv) < 2:
         print("Usage: python gible_base.py <command> [...]")
         print("\nAvailable commands:")
-        print("  init          - Initialize a new Gible repository")
-        print("  add <path>    - Stage a file or directory for commit")
-        print("  commit <msg>  - Record staged changes")
-        print("  branch <name> - Create a new branch")
-        print("  switch <name> - Switch to a different branch")
-        print("  merge <name>  - Merge a branch into the current branch")
-        print("  status        - Show the working tree status")
-        print("  checkout <id> - Checkout a specific commit")
-        print("  destroy       - Permanently delete the Gible repository")
-        print("  test-merge    - Run a pre-defined merge conflict test")
+        print("  init            - Initialize a new Gible repository")
+        print("  add <path>      - Stage a file or directory for commit")
+        print("  commit <msg>    - Record staged changes")
+        print("  branch <name>   - Create a new branch")
+        print("  switch <name>   - Switch to a different branch")
+        print("  merge <name>    - Merge a branch into the current branch")
+        print("  status          - Show the working tree status")
+        print("  restore <id>    - Restore working dir to a specific commit (was checkout)")
+        print("  destroy         - Permanently delete the Gible repository")
+        print("  test-merge      - Run a pre-defined merge conflict test")
+        print("  list-branches   - List branches")
+        print("  log-commits     - Log commits of current branch")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -913,15 +1028,19 @@ def main():
             repo.merge_branch(sys.argv[2])
     elif cmd == "status":
         repo.status()
-    elif cmd == "checkout":
+    elif cmd == "restore":
         if len(sys.argv) < 3:
-            print("Usage: checkout <commit_oid>")
+            print("Usage: restore <commit_oid>")
         else:
-            repo.checkout(sys.argv[2])
+            repo.restore_commit(sys.argv[2])
     elif cmd == "test-merge":
         run_merge_conflict_test()
     elif cmd == "destroy":
         repo.destroy()
+    elif cmd == "list-branches":
+        repo.list_branches()
+    elif cmd == "log-commits":
+        repo.log_current_branch()
     else:
         print(f"Unknown command: {cmd}")
 
