@@ -169,14 +169,15 @@ class GibleRepository:
         self.index = GibleIndex(self.repo_path)
         self.metadata_filepath = os.path.join(self.repo_path, METADATA_FILE)
         self.config_filepath = os.path.join(self.repo_path, CONFIG_FILE)
+        self.output_buffer: List[str] = [] # Add this line
 
     # -------------------------
     # Initialization
     # -------------------------
     def init(self):
         if os.path.exists(self.repo_path):
-            print(f"Repository already initialized at {self.repo_path}")
-            return False
+            self._log(f"Repository already initialized at {self.repo_path}")
+            return {"success": False, "message": "Repository already initialized."} # Modified
         os.makedirs(self.objects_path, exist_ok=True)
         initial_config = {
             "version": "0.5.0-deletion-support",
@@ -194,9 +195,15 @@ class GibleRepository:
         with open(self.metadata_filepath, "w", encoding='utf-8') as f:
             json.dump(initial_metadata, f, indent=2, ensure_ascii=False)
         self.index.clear()
-        print(f"Initialized Gible repository at {self.repo_path}")
-        return True
-
+        self._log(f"Initialized Gible repository at {self.repo_path}")
+        return {"success": True, "message": "Repository initialized successfully."} # Modified
+    
+    def _log(self, message: str):
+        if hasattr(self, 'output_buffer'): # Check if running in UI mode
+            self.output_buffer.append(message)
+        else:
+            self._log(message)
+    
     def is_repo(self) -> bool:
         return os.path.isdir(self.repo_path) and os.path.isdir(self.objects_path) and os.path.isfile(self.config_filepath)
 
@@ -237,6 +244,9 @@ class GibleRepository:
         return oid
 
     def _get_full_commit(self, oid: str) -> dict:
+        if not isinstance(oid, str): # Add this type check
+            raise ValueError(f"Invalid commit OID type: Expected string, got {type(oid).__name__} ({oid})")
+        
         try:
             commit_bytes = load_object(self.repo_path, oid, "commit")
             return json.loads(commit_bytes.decode('utf-8'))
@@ -244,7 +254,7 @@ class GibleRepository:
             metadata = self.load_metadata()
             meta_entry = metadata["commits"].get(oid)
             if not meta_entry:
-                raise FileNotFoundError(f"Commit object {oid} not found")
+                raise FileNotFoundError(f"Commit object {oid} not found in metadata or as file.")
             return {
                 "hash": oid,
                 "parent": meta_entry.get("parent"),
@@ -307,8 +317,8 @@ class GibleRepository:
     def add(self, filepath: str):
         abs_path = os.path.join(self.working_dir, filepath)
         if not os.path.exists(abs_path):
-            print(f"Error: Path not found: {filepath}")
-            return
+            self._log(f"Error: Path not found: {filepath}")
+            return {"success": False, "message": f"Path not found: {filepath}"} # Modified
         paths_to_process = []
         if os.path.isfile(abs_path):
             paths_to_process.append(abs_path)
@@ -326,7 +336,8 @@ class GibleRepository:
             mode = "text" if is_text_content(data) else "binary"
             content_hash = calculate_hash(data)
             self.index.add_file(rel, content_hash, mode)
-            print(f"Staged: {rel} (mode: {mode})")
+            self._log(f"Staged: {rel} (mode: {mode})")
+            return {"success": True, "message": f"Staged: {filepath}"} # Modified
 
     # -------------------------
     # Commit
@@ -350,8 +361,9 @@ class GibleRepository:
                 combined_files[f] = {"mode": "text"}  # mode doesn't matter, it's deleted
 
         if not combined_files:
-            print("No changes staged or detected. Nothing to commit.")
-            return
+            self._log("No changes staged or detected. Nothing to commit.")
+            # This is the return value that was causing issues if mistakenly stored
+            return {"success": False, "message": "No changes staged or detected. Nothing to commit."}
 
         new_files_map: Dict[str, List[Optional[str]]] = {}
         for filepath, info in combined_files.items():
@@ -360,7 +372,7 @@ class GibleRepository:
             # ---- handle deleted file on disk: record deletion ----
             if not os.path.exists(abs_path):
                 new_files_map[filepath] = ["deleted", None]
-                print(f"  {filepath}: deleted")
+                self._log(f"  {filepath}: deleted")
                 continue
 
             # file exists on disk -> normal processing
@@ -378,7 +390,7 @@ class GibleRepository:
             if prev_entry is None:
                 oid = save_object(self.repo_path, current_bytes, "base")
                 new_files_map[filepath] = ["base", oid]
-                print(f"  {filepath}: stored base ({oid[:8]})")
+                self._log(f"  {filepath}: stored base ({oid[:8]})")
             else:
                 # reconstruct last content; reconstruct may return None if file was deleted in history
                 try:
@@ -390,72 +402,52 @@ class GibleRepository:
                 if last_bytes is None:
                     oid = save_object(self.repo_path, current_bytes, "base")
                     new_files_map[filepath] = ["base", oid]
-                    print(f"  {filepath}: stored base ({oid[:8]})")
+                    self._log(f"  {filepath}: stored base ({oid[:8]})")
                     continue
 
                 if is_text:
                     diff_bytes = generate_text_diff(last_bytes, current_bytes)
                     if not json.loads(diff_bytes.decode('utf-8')):
                         new_files_map[filepath] = prev_entry
-                        print(f"  {filepath}: no changes (skipped)")
+                        self._log(f"  {filepath}: no changes (skipped)")
                     else:
                         oid = save_object(self.repo_path, diff_bytes, "diff")
                         new_files_map[filepath] = ["diff", oid]
-                        print(f"  {filepath}: stored text diff ({oid[:8]})")
+                        self._log(f"  {filepath}: stored text diff ({oid[:8]})")
                 else:
                     bin_diff = generate_binary_diff(last_bytes, current_bytes)
                     if len(bin_diff) < len(current_bytes):
                         oid = save_object(self.repo_path, bin_diff, "diff")
                         new_files_map[filepath] = ["diff", oid]
-                        print(f"  {filepath}: stored binary diff ({oid[:8]})")
+                        self._log(f"  {filepath}: stored binary diff ({oid[:8]})")
                     else:
                         oid = save_object(self.repo_path, current_bytes, "base")
                         new_files_map[filepath] = ["base", oid]
-                        print(f"  {filepath}: stored binary base ({oid[:8]})")
+                        self._log(f"  {filepath}: stored binary base ({oid[:8]})")
 
-        commit_obj = {
-            "parent": head,
-            "files": new_files_map,
-            "message": message,
-            "author": self.load_config().get("author", "unknown"),
-            "timestamp": datetime.now().isoformat()
-        }
-        commit_oid = self._write_commit_object(commit_obj)
-        print(f"[{current_branch}] {message}")
-        print(f"  commit {commit_oid}")
-        self.index.clear()
-        print("Staging area cleared.")
+            commit_obj = {
+                "parent": head, # head is a string or None, which is fine
+                "files": new_files_map,
+                "message": message,
+                "author": self.load_config().get("author", "unknown"),
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            commit_oid = self._write_commit_object(commit_obj) # This returns a string OID
+            # The _write_commit_object *already* updates metadata["head"] and metadata["branches"][current_branch]
+            # So there's no need for commit() to do it again here.
+
+            self._log(f"[{current_branch}] {message}")
+            self._log(f"  commit {commit_oid}")
+            self.index.clear()
+            self._log("Staging area cleared.")
+            return {"success": True, "commit_oid": commit_oid, "message": f"Committed: {commit_oid[:8]}"}
 
 
     # -------------------------
     # Branch utilities / ancestors
     # -------------------------
-    def create_branch(self, name: str):
-        metadata = self.load_metadata()
-        if name in metadata['branches']:
-            print(f"Branch '{name}' already exists")
-            return
-        metadata['branches'][name] = metadata['head']
-        self.save_metadata(metadata)
-        print(f"Branch '{name}' created at {metadata['head'][:8] if metadata['head'] else 'None'}")
-
-    def switch_branch(self, name: str, silent: bool = False):
-        metadata = self.load_metadata()
-        if name not in metadata['branches']:
-            if not silent: print(f"Branch '{name}' does not exist")
-            return
-        metadata['current_branch'] = name
-        head_commit = metadata['branches'][name]
-
-        # Update main HEAD to point to branch tip
-        metadata['head'] = head_commit
-
-        if head_commit:
-            self.restore_commit(head_commit)
-
-        self.save_metadata(metadata)
-        if not silent: print(f"Switched to branch '{name}'")
-
+    
     def _all_ancestors(self, oid: Optional[str]) -> Set[str]:
         """Return set of all ancestor oids including oid itself."""
         result: Set[str] = set()
@@ -482,6 +474,35 @@ class GibleRepository:
                 # broken commit chain; ignore
                 continue
         return result
+    
+    def create_branch(self, name: str):
+        metadata = self.load_metadata()
+        if name in metadata['branches']:
+            self._log(f"Branch '{name}' already exists")
+            return {"success": False, "message": f"Branch '{name}' already exists"} # Modified
+        metadata['branches'][name] = metadata['head']
+        self.save_metadata(metadata)
+        self._log(f"Branch '{name}' created at {metadata['head'][:8] if metadata['head'] else 'None'}")
+        return {"success": True, "message": f"Branch '{name}' created."} # Modified
+    
+    def switch_branch(self, name: str, silent: bool = False):
+        metadata = self.load_metadata()
+        if name not in metadata['branches']:
+            if not silent: self._log(f"Branch '{name}' does not exist")
+            return {"success": False, "message": f"Branch '{name}' does not exist"}
+
+        metadata['current_branch'] = name
+        head_commit = metadata['branches'][name] # <--- PROBLEM POINT 1
+
+        # Update main HEAD to point to branch tip
+        metadata['head'] = head_commit # <--- PROBLEM POINT 2 (if head_commit is a dict)
+
+        if head_commit: # This check is good
+            self.restore_commit(head_commit, silent=True) # <--- PROBLEM POINT 3 (if head_commit is a dict)
+
+        self.save_metadata(metadata)
+        if not silent: self._log(f"Switched to branch '{name}'")
+        return {"success": True, "message": f"Switched to branch '{name}'"}
 
     def _is_ancestor(self, ancestor: Optional[str], descendant: Optional[str]) -> bool:
         if not ancestor or not descendant:
@@ -584,15 +605,15 @@ class GibleRepository:
     def merge_branch(self, other_branch: str):
         metadata = self.load_metadata()
         if other_branch not in metadata['branches']:
-            print(f"Branch '{other_branch}' does not exist")
+            self._log(f"Branch '{other_branch}' does not exist")
             return
         current_branch = metadata.get("current_branch", "master")
         current_head = metadata['branches'].get(current_branch)
         other_head = metadata['branches'][other_branch]
 
         if current_head == other_head:
-            print("Already up-to-date.")
-            return
+            self._log("Already up-to-date.")
+            return {"success": True, "message": "Already up-to-date."} # Modified
 
         if other_head and self._is_ancestor(other_head, current_head):
             try:
@@ -601,21 +622,21 @@ class GibleRepository:
             except Exception:
                 meta = metadata.get("commits", {}).get(other_head, {})
                 msg = meta.get("message", "<no message>")
-            print(f"Branch '{current_branch}' already includes '{other_branch}' ({msg} @ {other_head[:8]}).")
-            return
+            self._log(f"Branch '{current_branch}' already includes '{other_branch}' ({msg} @ {other_head[:8]}).")
+            return {"success": True, "message": f"Branch '{current_branch}' already includes '{other_branch}'."} # Modified
 
         if current_head and self._is_ancestor(current_head, other_head):
-            print(f"Fast-forwarding '{current_branch}' to '{other_branch}'...")
-            self.restore_commit(other_head)
+            self._log(f"Fast-forwarding '{current_branch}' to '{other_branch}'...")
+            self.restore_commit(other_head) # Keep this as is for now for visual feedback during fast-forward
             metadata['branches'][current_branch] = other_head
             metadata['head'] = other_head
             self.save_metadata(metadata)
-            print(f"Fast-forwarded {current_branch} -> {other_head[:8]}")
-            return
+            self._log(f"Fast-forwarded {current_branch} -> {other_head[:8]}")
+            return {"success": True, "message": f"Fast-forwarded to {other_branch}."} # Modified
 
         base_head = self._find_common_ancestor(current_head, other_head)
-        print(f"Merging '{other_branch}' ({other_head[:8] if other_head else 'None'}) into '{current_branch}' ({current_head[:8] if current_head else 'None'})")
-        print(f"Common ancestor: {base_head[:8] if base_head else 'None'}")
+        self._log(f"Merging '{other_branch}' ({other_head[:8] if other_head else 'None'}) into '{current_branch}' ({current_head[:8] if current_head else 'None'})")
+        self._log(f"Common ancestor: {base_head[:8] if base_head else 'None'}")
 
         files_base = self.get_commit_tree(base_head) if base_head else {}
         files_current = self.get_commit_tree(current_head) if current_head else {}
@@ -750,17 +771,11 @@ class GibleRepository:
 
         # If conflicts occurred: prompt user
         if conflict_occurred:
-            print("\nAutomatic merge produced conflicts.")
-            print(f"Conflict details saved under: {merge_dir}")
-            while True:
-                ans = input("Forcefully create merge commit containing conflict markers? (y/n): ").strip().lower()
-                if ans in ("y", "n"):
-                    break
-            if ans == "n":
-                print("Merge aborted. No commit created. Resolve conflicts manually or re-run merge after resolving.")
-                return
-
-        # create merge commit
+            self._log("\nAutomatic merge produced conflicts.")
+            self._log(f"Conflict details saved under: {merge_dir}")
+            return {"success": False, "message": "Merge aborted. Conflicts detected.", "conflicts": True, "merge_dir": merge_dir} # This return is fine.
+    
+        # If no conflicts, create merge commit
         merge_commit_obj = {
             "parent": [current_head, other_head],
             "files": merged_files,
@@ -768,14 +783,16 @@ class GibleRepository:
             "author": self.load_config().get("author", "unknown"),
             "timestamp": datetime.now().isoformat()
         }
+        
+        # If successful, commit_oid is a string and updates metadata correctly
         commit_oid = self._write_commit_object(merge_commit_obj)
-        print(f"Merge commit created: {commit_oid} {'(with conflicts)' if conflict_occurred else '(no conflicts)'}")
+        self._log(f"Merge commit created: {commit_oid} {'(with conflicts)' if conflict_occurred else '(no conflicts)'}")
 
-        # update branch head to new commit
         metadata['branches'][current_branch] = commit_oid
         metadata['head'] = commit_oid
         self.save_metadata(metadata)
-        print(f"Updated {current_branch} -> {commit_oid[:8]}")
+        self._log(f"Updated {current_branch} -> {commit_oid[:8]}")
+        return {"success": True, "message": "Merge completed successfully."} # Modified
 
     # -------------------------
     # Helpers: commit tree, restore (was checkout)
@@ -789,7 +806,7 @@ class GibleRepository:
         except FileNotFoundError:
             return {}
 
-    def restore_commit(self, commit_oid: str):
+    def restore_commit(self, commit_oid: str, silent: bool = False):    
         """
         Restore (rollback) working directory to match commit_oid.
         Handles 'deleted' entries by removing files from disk.
@@ -865,72 +882,102 @@ class GibleRepository:
                     Path(abs_path).write_bytes(data)
                 continue
 
-        print(f"Restored commit {commit_oid[:8]}")
+        
+        if not silent: # Only log if not silent
+            self._log(f"Restored commit {commit_oid[:8]}")
+        return {"success": True, "message": f"Restored commit {commit_oid[:8]}"} # Modified
 
     # -------------------------
     # Status
     # -------------------------
     def status(self):
         metadata = self.load_metadata()
-        print(f"On branch: {metadata.get('current_branch', 'master')}")
+        self._log(f"On branch: {metadata.get('current_branch', 'master')}")
         staged = self.index.get_all()
         if not staged:
-            print("No files staged")
+            self._log("No files staged")
         else:
-            print("Staged files:")
+            self._log("Staged files:")
             for f, info in staged.items():
-                print(f"  {f} ({info.get('mode')})")
+                self._log(f"  {f} ({info.get('mode')})")
 
     # -------------------------
     # Destroy repository
     # -------------------------
     def destroy(self):
-        """Permanently removes the .gible repository directory."""
         if not self.is_repo():
-            print("Not a Gible repository. Nothing to destroy.")
-            return
+            self._log("Not a Gible repository. Nothing to destroy.")
+            return {"success": False, "message": "Not a Gible repository. Nothing to destroy."} # Modified
 
-        confirm = input(f"This will permanently delete the Gible repository at {self.repo_path}.\nAre you sure? (y/n): ").strip().lower()
-        if confirm == 'y':
-            try:
-                shutil.rmtree(self.repo_path)
-                print(f"Gible repository at {self.repo_path} has been destroyed.")
-            except Exception as e:
-                print(f"Error destroying repository: {e}")
-        else:
-            print("Destroy operation cancelled.")
+        # Remove the confirmation prompt, UI will handle it
+        # confirm = input(f"This will permanently delete the Gible repository at {self.repo_path}.\nAre you sure? (y/n): ").strip().lower()
+        # if confirm == 'y':
+        try:
+            shutil.rmtree(self.repo_path)
+            self._log(f"Gible repository at {self.repo_path} has been destroyed.")
+            return {"success": True, "message": f"Gible repository at {self.repo_path} has been destroyed."} # Modified
+        except Exception as e:
+            self._log(f"Error destroying repository: {e}")
+            return {"success": False, "message": f"Error destroying repository: {e}"} # Modified
+        # else:
+        #     self._log("Destroy operation cancelled.")
+        #     return {"success": False, "message": "Destroy operation cancelled."} # Modified
 
     # -------------------------
     # Convenience: branches & logs
     # -------------------------
+    
+    def current_branch(self) -> str:
+        metadata = self.load_metadata()
+        return metadata.get("current_branch", "master")
+    
     def list_branches(self):
         metadata = self.load_metadata()
-        current = metadata.get("current_branch")
-        print("Branches:")
-        for name, oid in metadata["branches"].items():
-            mark = "*" if name == current else " "
-            short = oid[:8] if oid else "None"
-            print(f"{mark} {name} ({short})")
+        return list(metadata["branches"].keys()) # Modified
 
-    def log_current_branch(self):
+    def list_commits(self, branch_name: Optional[str] = None) -> List[Dict[str, str]]: # Modified signature
         metadata = self.load_metadata()
         head = metadata.get("head")
-        if not head:
-            print("No commits yet.")
-            return
+        if branch_name:
+            head = metadata["branches"].get(branch_name)
 
-        current = self.load_metadata().get('current_branch')
-        print(f"Commit history of branch {current}:")
+        if head is None: # Check if head is None
+            return [] # Return empty list if no commits
 
-        while head:
-            c = self._get_full_commit(head)
-            msg = c.get("message", "")
-            ts = c.get("timestamp", "")
-            print(f"{head}\n  {ts}\n  {msg}\n")
+        # Add a check here just in case 'head' somehow got corrupted with a dict
+        if not isinstance(head, str):
+            self._log(f"Warning: Corrupted 'head' reference in metadata: {head}. Resetting to None.")
+            metadata["head"] = None
+            if branch_name:
+                metadata["branches"][branch_name] = None
+            self.save_metadata(metadata) # Save the corrected metadata
+            return [] # Cannot list commits from a corrupted head
+
+        commits_list: List[Dict[str, str]] = []
+
+        current_commit_oid = head
+        while current_commit_oid:
+            # The type check in _get_full_commit will catch non-string parents.
+            # But the primary head should be clean here.
+            c = self._get_full_commit(current_commit_oid)
+            commits_list.append({
+                "oid": current_commit_oid,
+                "message": c.get("message", ""),
+                "timestamp": c.get("timestamp", ""),
+                "author": c.get("author", "unknown"),
+                "parent": c.get("parent")
+            })
             parent = c.get("parent")
             if isinstance(parent, list):
                 parent = parent[0]
-            head = parent
+            if parent is None: # Explicitly break if parent is None
+                break
+            # Ensure parent is a string for the next iteration
+            if not isinstance(parent, str):
+                self._log(f"Warning: Corrupted parent reference for commit {current_commit_oid}: {parent}. Terminating commit log.")
+                break
+            current_commit_oid = parent
+        return commits_list
 
 # -------------------------
 # Test helper: construct repo & cause a same-line conflict + deletion test
@@ -975,74 +1022,74 @@ def run_merge_conflict_test():
     print("Merge dir:", os.path.join(repo.repo_path, "merge"))
     print("Test done. Remove temp dir when finished:", tmp)
 
-# -------------------------
-# CLI
-# -------------------------
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python gible_base.py <command> [...]")
-        print("\nAvailable commands:")
-        print("  init            - Initialize a new Gible repository")
-        print("  add <path>      - Stage a file or directory for commit")
-        print("  commit <msg>    - Record staged changes")
-        print("  branch <name>   - Create a new branch")
-        print("  switch <name>   - Switch to a different branch")
-        print("  merge <name>    - Merge a branch into the current branch")
-        print("  status          - Show the working tree status")
-        print("  restore <id>    - Restore working dir to a specific commit (was checkout)")
-        print("  destroy         - Permanently delete the Gible repository")
-        print("  test-merge      - Run a pre-defined merge conflict test")
-        print("  list-branches   - List branches")
-        print("  log-commits     - Log commits of current branch")
-        sys.exit(1)
+# # -------------------------
+# # CLI
+# # -------------------------
+# def main():
+#     if len(sys.argv) < 2:
+#         print("Usage: python gible_base.py <command> [...]")
+#         print("\nAvailable commands:")
+#         print("  init            - Initialize a new Gible repository")
+#         print("  add <path>      - Stage a file or directory for commit")
+#         print("  commit <msg>    - Record staged changes")
+#         print("  branch <name>   - Create a new branch")
+#         print("  switch <name>   - Switch to a different branch")
+#         print("  merge <name>    - Merge a branch into the current branch")
+#         print("  status          - Show the working tree status")
+#         print("  restore <id>    - Restore working dir to a specific commit (was checkout)")
+#         print("  destroy         - Permanently delete the Gible repository")
+#         print("  test-merge      - Run a pre-defined merge conflict test")
+#         print("  list-branches   - List branches")
+#         print("  log-commits     - Log commits of current branch")
+#         sys.exit(1)
 
-    cmd = sys.argv[1]
-    repo = GibleRepository(os.getcwd())
+#     cmd = sys.argv[1]
+#     repo = GibleRepository(os.getcwd())
 
-    if cmd == "init":
-        repo.init()
-    elif cmd == "add":
-        if len(sys.argv) < 3:
-            print("Usage: add <path>")
-        else:
-            repo.add(sys.argv[2])
-    elif cmd == "commit":
-        if len(sys.argv) < 3:
-            print("Usage: commit <message>")
-        else:
-            repo.commit(sys.argv[2])
-    elif cmd == "branch":
-        if len(sys.argv) < 3:
-            print("Usage: branch <name>")
-        else:
-            repo.create_branch(sys.argv[2])
-    elif cmd == "switch":
-        if len(sys.argv) < 3:
-            print("Usage: switch <branch>")
-        else:
-            repo.switch_branch(sys.argv[2])
-    elif cmd == "merge":
-        if len(sys.argv) < 3:
-            print("Usage: merge <branch>")
-        else:
-            repo.merge_branch(sys.argv[2])
-    elif cmd == "status":
-        repo.status()
-    elif cmd == "restore":
-        if len(sys.argv) < 3:
-            print("Usage: restore <commit_oid>")
-        else:
-            repo.restore_commit(sys.argv[2])
-    elif cmd == "test-merge":
-        run_merge_conflict_test()
-    elif cmd == "destroy":
-        repo.destroy()
-    elif cmd == "list-branches":
-        repo.list_branches()
-    elif cmd == "log-commits":
-        repo.log_current_branch()
-    else:
-        print(f"Unknown command: {cmd}")
+#     if cmd == "init":
+#         repo.init()
+#     elif cmd == "add":
+#         if len(sys.argv) < 3:
+#             print("Usage: add <path>")
+#         else:
+#             repo.add(sys.argv[2])
+#     elif cmd == "commit":
+#         if len(sys.argv) < 3:
+#             print("Usage: commit <message>")
+#         else:
+#             repo.commit(sys.argv[2])
+#     elif cmd == "branch":
+#         if len(sys.argv) < 3:
+#             print("Usage: branch <name>")
+#         else:
+#             repo.create_branch(sys.argv[2])
+#     elif cmd == "switch":
+#         if len(sys.argv) < 3:
+#             print("Usage: switch <branch>")
+#         else:
+#             repo.switch_branch(sys.argv[2])
+#     elif cmd == "merge":
+#         if len(sys.argv) < 3:
+#             print("Usage: merge <branch>")
+#         else:
+#             repo.merge_branch(sys.argv[2])
+#     elif cmd == "status":
+#         repo.status()
+#     elif cmd == "restore":
+#         if len(sys.argv) < 3:
+#             print("Usage: restore <commit_oid>")
+#         else:
+#             repo.restore_commit(sys.argv[2])
+#     elif cmd == "test-merge":
+#         run_merge_conflict_test()
+#     elif cmd == "destroy":
+#         repo.destroy()
+#     elif cmd == "list-branches":
+#         repo.list_branches()
+#     elif cmd == "log-commits":
+#         repo.list_commits()
+#     else:
+#         print(f"Unknown command: {cmd}")
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()
