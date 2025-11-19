@@ -346,38 +346,43 @@ class GibleRepository:
         metadata = self.load_metadata()
         head = metadata.get("head")
         current_branch = metadata.get("current_branch", "master")
-        staged = self.index.get_all()
+        staged = self.index.get_all()  # dict of staged entries
 
-        # Automatically detect previously tracked files that are now missing on disk
-        previously_tracked_files = set()
+        # Start from previous commit tree (full snapshot) so unchanged files are preserved
+        prev_files = {}
         if head:
-            previously_tracked_files = set(self.get_commit_tree(head).keys())
+            try:
+                prev_files = self.get_commit_tree(head).copy()
+            except Exception:
+                prev_files = {}
+
+        # new_files_map begins as a copy of the previous snapshot
+        new_files_map: Dict[str, List[Optional[str]]] = prev_files.copy()
+
+        # Detect files that were tracked before but are now missing on disk -> mark deleted
+        previously_tracked_files = set(prev_files.keys())
         missing_files = {f for f in previously_tracked_files if not os.path.exists(os.path.join(self.working_dir, f))}
-
-        # Combine staged files + missing files
-        combined_files = staged.copy()
         for f in missing_files:
-            if f not in combined_files:
-                combined_files[f] = {"mode": "text"}  # mode doesn't matter, it's deleted
+            # only set deleted if not already recorded as deleted in staged (staged may include explicit delete)
+            staged_entry = staged.get(f)
+            if staged_entry is None:
+                new_files_map[f] = ["deleted", None]
+                self._log(f"  {f}: recorded deletion (missing on disk)")
 
-        if not combined_files:
-            self._log("No changes staged or detected. Nothing to commit.")
-            # This is the return value that was causing issues if mistakenly stored
-            return {"success": False, "message": "No changes staged or detected. Nothing to commit."}
-
-        new_files_map: Dict[str, List[Optional[str]]] = {}
-        for filepath, info in combined_files.items():
+        # Apply staged changes (create/modify/delete)
+        for filepath, info in staged.items():
             abs_path = os.path.join(self.working_dir, filepath)
 
-            # ---- handle deleted file on disk: record deletion ----
-            if not os.path.exists(abs_path):
+            # If staged indicates deletion or file missing -> record deletion
+            if info.get("action") == "delete" or not os.path.exists(abs_path):
                 new_files_map[filepath] = ["deleted", None]
-                self._log(f"  {filepath}: deleted")
+                self._log(f"  {filepath}: staged/recorded deleted")
                 continue
 
-            # file exists on disk -> normal processing
+            # File exists on disk -> prepare to store base/diff
             current_bytes = Path(abs_path).read_bytes()
             is_text = (info.get("mode") == "text")
+
             prev_entry = None
             if head:
                 try:
@@ -386,62 +391,76 @@ class GibleRepository:
                 except FileNotFoundError:
                     prev_entry = None
 
-            # if no previous recorded entry -> store base
+            # If no previous entry -> store base
             if prev_entry is None:
                 oid = save_object(self.repo_path, current_bytes, "base")
                 new_files_map[filepath] = ["base", oid]
                 self._log(f"  {filepath}: stored base ({oid[:8]})")
-            else:
-                # reconstruct last content; reconstruct may return None if file was deleted in history
-                try:
-                    last_bytes = self.reconstruct_file_bytes(head, filepath)
-                except FileNotFoundError:
-                    last_bytes = None
+                continue
 
-                # treat last_bytes None as "no previous content" (store base)
-                if last_bytes is None:
+            # Reconstruct last content (may raise or return None if deleted)
+            try:
+                last_bytes = self.reconstruct_file_bytes(head, filepath)
+            except FileNotFoundError:
+                last_bytes = None
+
+            # treat last_bytes None as "no previous content" -> store base
+            if last_bytes is None:
+                oid = save_object(self.repo_path, current_bytes, "base")
+                new_files_map[filepath] = ["base", oid]
+                self._log(f"  {filepath}: stored base ({oid[:8]})")
+                continue
+
+            # Now produce diff or base depending on size/content
+            if is_text:
+                diff_bytes = generate_text_diff(last_bytes, current_bytes)
+                # if diff is empty, preserve previous entry (no-op)
+                try:
+                    diff_json = json.loads(diff_bytes.decode("utf-8"))
+                except Exception:
+                    diff_json = diff_bytes and True
+                if not diff_json:
+                    # no changes -> keep previous object reference
+                    new_files_map[filepath] = prev_entry
+                    self._log(f"  {filepath}: no changes (skipped)")
+                else:
+                    oid = save_object(self.repo_path, diff_bytes, "diff")
+                    new_files_map[filepath] = ["diff", oid]
+                    self._log(f"  {filepath}: stored text diff ({oid[:8]})")
+            else:
+                bin_diff = generate_binary_diff(last_bytes, current_bytes)
+                if len(bin_diff) < len(current_bytes):
+                    oid = save_object(self.repo_path, bin_diff, "diff")
+                    new_files_map[filepath] = ["diff", oid]
+                    self._log(f"  {filepath}: stored binary diff ({oid[:8]})")
+                else:
                     oid = save_object(self.repo_path, current_bytes, "base")
                     new_files_map[filepath] = ["base", oid]
-                    self._log(f"  {filepath}: stored base ({oid[:8]})")
-                    continue
+                    self._log(f"  {filepath}: stored binary base ({oid[:8]})")
 
-                if is_text:
-                    diff_bytes = generate_text_diff(last_bytes, current_bytes)
-                    if not json.loads(diff_bytes.decode('utf-8')):
-                        new_files_map[filepath] = prev_entry
-                        self._log(f"  {filepath}: no changes (skipped)")
-                    else:
-                        oid = save_object(self.repo_path, diff_bytes, "diff")
-                        new_files_map[filepath] = ["diff", oid]
-                        self._log(f"  {filepath}: stored text diff ({oid[:8]})")
-                else:
-                    bin_diff = generate_binary_diff(last_bytes, current_bytes)
-                    if len(bin_diff) < len(current_bytes):
-                        oid = save_object(self.repo_path, bin_diff, "diff")
-                        new_files_map[filepath] = ["diff", oid]
-                        self._log(f"  {filepath}: stored binary diff ({oid[:8]})")
-                    else:
-                        oid = save_object(self.repo_path, current_bytes, "base")
-                        new_files_map[filepath] = ["base", oid]
-                        self._log(f"  {filepath}: stored binary base ({oid[:8]})")
+        # If nothing changed compared to prev_files, abort commit
+        # Compare new_files_map to prev_files for equality (simple heuristic)
+        if new_files_map == prev_files:
+            self._log("No changes staged or detected. Nothing to commit.")
+            return {"success": False, "message": "No changes staged or detected. Nothing to commit."}
 
-            commit_obj = {
-                "parent": head, # head is a string or None, which is fine
-                "files": new_files_map,
-                "message": message,
-                "author": self.load_config().get("author", "unknown"),
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            commit_oid = self._write_commit_object(commit_obj) # This returns a string OID
-            # The _write_commit_object *already* updates metadata["head"] and metadata["branches"][current_branch]
-            # So there's no need for commit() to do it again here.
+        # Build commit object AFTER processing all files
+        commit_obj = {
+            "parent": head,
+            "files": new_files_map,
+            "message": message,
+            "author": self.load_config().get("author", "unknown"),
+            "timestamp": datetime.now().isoformat()
+        }
 
-            self._log(f"[{current_branch}] {message}")
-            self._log(f"  commit {commit_oid}")
-            self.index.clear()
-            self._log("Staging area cleared.")
-            return {"success": True, "commit_oid": commit_oid, "message": f"Committed: {commit_oid[:8]}"}
+        commit_oid = self._write_commit_object(commit_obj)  # this should update metadata/head as before
+
+        self._log(f"[{current_branch}] {message}")
+        self._log(f"  commit {commit_oid}")
+        self.index.clear()
+        self._log("Staging area cleared.")
+        return {"success": True, "commit_oid": commit_oid, "message": f"Committed: {commit_oid[:8]}"}
+
 
 
     # -------------------------
@@ -806,43 +825,13 @@ class GibleRepository:
         except FileNotFoundError:
             return {}
 
-    def restore_commit(self, commit_oid: str, silent: bool = False):    
+    
+    def restore_commit(self, commit_oid: str, silent: bool = False):
         """
-        Restore (rollback) working directory to match commit_oid.
-        Handles 'deleted' entries by removing files from disk.
+        Restore working directory to match commit_oid.
+        Only delete files explicitly marked 'deleted' (or that reconstruct to None).
         """
         files_map = self.get_commit_tree(commit_oid)
-
-        # Determine currently tracked files (from current HEAD in metadata)
-        metadata = self.load_metadata()
-        current_head = metadata.get("head")
-        current_tracked = set()
-        if current_head:
-            current_tracked = set(self.get_commit_tree(current_head).keys())
-
-        # Remove tracked files that won't be in the new commit (Option C behavior)
-        for f in list(current_tracked):
-            if f not in files_map:
-                abs_path = os.path.join(self.working_dir, f)
-                # safety: don't touch .gible
-                if GIBLE_REPO_DIR in Path(abs_path).parts:
-                    continue
-                if os.path.exists(abs_path):
-                    try:
-                        os.remove(abs_path)
-                    except Exception:
-                        pass
-                    # try removing empty parent directories
-                    parent = os.path.dirname(abs_path)
-                    while parent and parent != self.working_dir and parent.startswith(self.working_dir):
-                        try:
-                            if not os.listdir(parent):
-                                os.rmdir(parent)
-                            else:
-                                break
-                        except Exception:
-                            break
-                        parent = os.path.dirname(parent)
 
         # Write files from commit (overwrites existing or creates new; handles 'deleted')
         for filepath, entry in files_map.items():
@@ -850,7 +839,9 @@ class GibleRepository:
 
             abs_path = os.path.join(self.working_dir, filepath)
             # Create parent dirs
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            parent_dir = os.path.dirname(abs_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
 
             if obj_type == "deleted":
                 # ensure file removed
@@ -859,6 +850,17 @@ class GibleRepository:
                         os.remove(abs_path)
                     except Exception:
                         pass
+                # try to remove empty parent directories up to working_dir
+                parent = parent_dir
+                while parent and parent != self.working_dir and parent.startswith(self.working_dir):
+                    try:
+                        if not os.listdir(parent):
+                            os.rmdir(parent)
+                        else:
+                            break
+                    except Exception:
+                        break
+                    parent = os.path.dirname(parent)
                 continue
 
             if obj_type == "base":
@@ -878,14 +880,29 @@ class GibleRepository:
                             os.remove(abs_path)
                         except Exception:
                             pass
+                    # cleanup parent dirs
+                    parent = os.path.dirname(abs_path)
+                    while parent and parent != self.working_dir and parent.startswith(self.working_dir):
+                        try:
+                            if not os.listdir(parent):
+                                os.rmdir(parent)
+                            else:
+                                break
+                        except Exception:
+                            break
+                        parent = os.path.dirname(parent)
                 else:
                     Path(abs_path).write_bytes(data)
                 continue
 
-        
-        if not silent: # Only log if not silent
+        # IMPORTANT: Do NOT delete other files present in working_dir that are not listed in files_map.
+        # The commit snapshot should be authoritative; because commit now contains the full snapshot,
+        # files_map will include unchanged files. If any file must be deleted it should be listed explicitly.
+
+        if not silent:
             self._log(f"Restored commit {commit_oid[:8]}")
-        return {"success": True, "message": f"Restored commit {commit_oid[:8]}"} # Modified
+        return {"success": True, "message": f"Restored commit {commit_oid[:8]}"}
+
 
     # -------------------------
     # Status

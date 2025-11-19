@@ -330,13 +330,19 @@ class ExplorerEditorScreen(ctk.CTkFrame):
         self.main_container = tk.Frame(self, bg=bg_color)
         self.main_container.pack(fill="both", expand=True)
 
+
         # --- Left Explorer ---
         self.explorer_left = tk.Frame(self.main_container, bg="#09364C", width=450, padx=30, pady=60)
         self.explorer_left.pack(side="left", fill="y")
         self.explorer_left.pack_propagate(False)
 
+        self.branch_name = tk.Frame(self.explorer_left, bg="#09364C", width=250,height=40, padx=0, pady=0)
+        self.branch_name.pack(side="top")
+        
+
         self.file_tree = ttk.Treeview(self.explorer_left, show="tree")
-        self.file_tree.pack(fill="both", expand=True)
+        self.file_tree.pack(fill="both", expand=True, pady=(30,0))
+        self.file_tree.pack_propagate(False)
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -452,7 +458,7 @@ class ExplorerEditorScreen(ctk.CTkFrame):
             if self.active_editor:
                 self.active_editor.pack_forget()
             lbl = tk.Label(self.editor_frame, text=f"# Folder: {full_path.name}",
-                           bg="#1f1f1f", fg="#555555", font=mono_font)
+                           bg="#042A3A", fg="#555555", font=mono_font)
             lbl.pack(expand=True)
             self.active_editor = lbl
             return
@@ -479,17 +485,19 @@ class ExplorerEditorScreen(ctk.CTkFrame):
             try:
                 content = full_path.read_text(encoding='utf-8')
                 new_editor = tk.Text(
-                    self.editor_frame, bg="#1f1f1f", fg=editor_text_color,
+                    self.editor_frame, bg="#02202E", fg=editor_text_color,
                     font=mono_font, insertbackground=editor_text_color,
                     undo=True, maxundo=-1,  # Allow large undo
-                    highlightthickness=0, bd=0
+                    highlightthickness=0, bd=0,padx=20, pady=20
                 )
+                new_editor.place(x=0, y=0, width=0.95*self.editor_frame.winfo_width(), height=0.9*self.editor_frame.winfo_height())
+                new_editor.pack_propagate(False)
                 new_editor.insert("1.0", content)
 
                 # Reset the undo stack so "inserting initial content" isn't the first undo
                 new_editor.edit_reset()
 
-                new_editor.pack(fill="both", expand=True)
+                # new_editor.pack(fill="both", expand=True)
 
                 # Store it
                 self.file_editors[str_path] = new_editor
@@ -550,6 +558,10 @@ class ExplorerEditorScreen(ctk.CTkFrame):
 
         self.repo_path = Path(repo_data["path"])
         self.repo = GibleRepository(str(self.repo_path))
+
+        curr_br="Branch: "+self.repo.current_branch()
+        self.branch_disp=tk.Label(self.branch_name, text=curr_br, fg=text_color, bg="#09364C", font=mono_font)
+        self.branch_disp.pack(padx=10, pady=10)
 
         if not self.repo.is_repo():
             init_result = self.repo.init()
@@ -888,6 +900,8 @@ class ExplorerEditorScreen(ctk.CTkFrame):
         res = self.repo.switch_branch(name)
         if res.get("success", False):
             messagebox.showinfo("Switch", res.get("message", "Switched branch"))
+            curr_br=self.repo.current_branch()
+            self.branch_disp.config(text=curr_br)
             # IMPORTANT: This clears the old file editors so undo history
             # from Branch A doesn't bleed into Branch B
             self.refresh_files()
