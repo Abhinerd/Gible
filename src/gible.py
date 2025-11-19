@@ -36,15 +36,15 @@ def save_repo_list(repos):
 # -------------------------------
 # Fonts / Colors
 # -------------------------------
-repo_title_font = ("Stack Sans Text", 21, "bold")
-repo_detail_font = ("Stack Sans Text", 14)
-mono_font = ("Stack Sans Text", 16)
+repo_title_font = ("Lexend", 21, "bold")
+repo_detail_font = ("Lexend", 14)
+mono_font = ("Lexend", 16)
 
 bg_color = "#010A15"
-repo_card_color = "#1e1e1e"
+repo_card_color = "#6792a9"
 text_color = "#cccccc"
-subtext_color = "#858585"
-hover_color = "#1c4386"
+subtext_color = "#B9E2E7"
+hover_color = "#146acc"
 editor_text_color = "#cccccc"
 
 
@@ -61,7 +61,7 @@ class RepoListScreen(ctk.CTkFrame):
         heading_frame.pack(fill="x", padx=90, pady=(80, 10))
 
         heading = ctk.CTkLabel(
-            heading_frame, text="REPOSITORIES", font=("Stack Sans Text", 50, "bold"),
+            heading_frame, text="REPOSITORIES", font=("Lexend", 50, "bold"),
             text_color=text_color, anchor="w"
         )
         heading.pack(side="left", anchor="w")
@@ -73,15 +73,15 @@ class RepoListScreen(ctk.CTkFrame):
         import_btn = ctk.CTkButton(
             btn_frame, text="Import", width=150, height=45,
             fg_color="#333333", hover_color=hover_color,
-            font=("Stack Sans Text", 17, "bold"),
+            font=("Lexend", 17, "bold"),
             command=self.import_repository # <--- New Command
         )
         import_btn.pack(side="right", padx=(10, 0))
 
         add_button = ctk.CTkButton(
             btn_frame, text="Add Folder", width=150, height=45,
-            fg_color=subtext_color, hover_color=hover_color,
-            font=("Stack Sans Text", 17, "bold"),
+            fg_color="#333333", hover_color=hover_color,
+            font=("Lexend", 17, "bold"),
             command=self.add_repository
         )
         add_button.pack(side="right")
@@ -331,7 +331,7 @@ class ExplorerEditorScreen(ctk.CTkFrame):
         self.main_container.pack(fill="both", expand=True)
 
         # --- Left Explorer ---
-        self.explorer_left = tk.Frame(self.main_container, bg="#181818", width=450, padx=30, pady=60)
+        self.explorer_left = tk.Frame(self.main_container, bg="#09364C", width=450, padx=30, pady=60)
         self.explorer_left.pack(side="left", fill="y")
         self.explorer_left.pack_propagate(False)
 
@@ -340,8 +340,8 @@ class ExplorerEditorScreen(ctk.CTkFrame):
 
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("Treeview", background="#181818", foreground=text_color,
-                        rowheight=32, fieldbackground="#181818", font=mono_font)
+        style.configure("Treeview", background="#02202E", foreground=text_color,
+                        rowheight=32, fieldbackground="#02202E", font=mono_font)
         style.map("Treeview", background=[("selected", hover_color)], foreground=[("selected", "#ffffff")])
 
         self.file_tree.bind("<<TreeviewSelect>>", self.load_file)
@@ -349,24 +349,24 @@ class ExplorerEditorScreen(ctk.CTkFrame):
         # Back button
         self.back_btn = ctk.CTkButton(
             self.explorer_left, text="← Back to Repos",
-            fg_color="#2d2d2d", hover_color=hover_color, corner_radius=5,font=mono_font,
+            fg_color="#1D3441", hover_color=hover_color, corner_radius=5,font=mono_font,
             command=lambda: master.show_frame(RepoListScreen)
         )
         self.back_btn.pack(side="bottom", pady=(30,50))
 
         # --- Right Editor Area ---
-        self.editor_right = tk.Frame(self.main_container, bg="#1f1f1f", padx=20)
+        self.editor_right = tk.Frame(self.main_container, bg="#042A3A", padx=20)
         self.editor_right.pack(side="left", fill="both", expand=True)
 
         # Button Bar
-        self.button_bar = tk.Frame(self.editor_right, bg="#1f1f1f")
+        self.button_bar = tk.Frame(self.editor_right, bg="#042A3A")
         self.button_bar.pack(fill="x", pady=60)
 
         def add_btn(text, cmd):
             btn = ctk.CTkButton(self.button_bar, text=text, width=120,
-                                fg_color="#444444", hover_color=hover_color,
+                                fg_color="#1D3441", hover_color=hover_color,
                                 command=cmd,
-                                font=("Stack Sans Text",16, "bold"))
+                                font=("Lexend",16, "bold"))
             btn.pack(side="left", padx=8)
 
         add_btn("Commit", self.commit_action)
@@ -378,7 +378,7 @@ class ExplorerEditorScreen(ctk.CTkFrame):
         add_btn("Refresh", self.refresh_files)
 
         # Container for Text Widgets (The editors will be packed into this frame)
-        self.editor_frame = tk.Frame(self.editor_right, bg="#1f1f1f")
+        self.editor_frame = tk.Frame(self.editor_right, bg="#042A3A")
         self.editor_frame.pack(fill="both", expand=True)
 
         # Keybinds
@@ -576,7 +576,7 @@ class ExplorerEditorScreen(ctk.CTkFrame):
 
         # Show a placeholder label since no file is selected yet
         lbl = tk.Label(self.editor_frame, text="Select a file to edit",
-                       bg="#1f1f1f", fg="#555555", font=mono_font)
+                       bg="#042A3A", fg="#97A0A4", font=mono_font)
         lbl.pack(expand=True)
         # We store this label as active_editor temporarily just so pack_forget works later
         self.active_editor = lbl
