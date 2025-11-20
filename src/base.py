@@ -12,7 +12,6 @@ from typing import List, Tuple, Dict, Optional, Set
 import bsdiff4
 import uuid
 import base64
-import tempfile
 
 # -------------------------
 # Configuration / Paths
@@ -997,46 +996,3 @@ class GibleRepository:
                 break
             current_commit_oid = parent
         return commits_list
-
-# -------------------------
-# Test helper: construct repo & cause a same-line conflict + deletion test
-# -------------------------
-def run_merge_conflict_test():
-    tmp = tempfile.mkdtemp(prefix="gible-test-")
-    print("Test repo directory:", tmp)
-    repo = GibleRepository(tmp)
-    repo.init()
-
-    # write base file and commit on master
-    Path(os.path.join(tmp, "1.txt")).write_text("line1\nline2\nline3\n", encoding="utf-8")
-    Path(os.path.join(tmp, "to_delete.txt")).write_text("delete me\n", encoding="utf-8")
-    repo.add("1.txt")
-    repo.add("to_delete.txt")
-    repo.commit("base commit")
-
-    # create branch 'feature'
-    repo.create_branch("feature")
-    repo.switch_branch("feature")
-    # modify same line differently and commit
-    Path(os.path.join(tmp, "1.txt")).write_text("line1\nfeature-modified-line2\nline3\n", encoding="utf-8")
-    repo.add("1.txt")
-    repo.commit("feature edits")
-
-    # switch back to master and make a conflicting edit and commit and delete a file
-    repo.switch_branch("master")
-    Path(os.path.join(tmp, "1.txt")).write_text("line1\nmaster-modified-line2\nline3\n", encoding="utf-8")
-    os.remove(os.path.join(tmp, "to_delete.txt"))  # delete file on disk
-    repo.add("1.txt")
-    # stage deletion by leaving to_delete.txt in index but absent on disk:
-    # (index still has it from initial add; commit() will detect file missing and record deletion)
-    repo.commit("master edits (and deletion)")
-
-    # merge feature into master: should detect conflict
-    print("\n=== Now merging 'feature' into 'master' (expected conflict) ===")
-    repo.merge_branch("feature")
-
-    print("\nCheck working copy (1.txt) for conflict markers and merge dir:")
-    print("Working file:")
-    print(Path(os.path.join(tmp, "1.txt")).read_text(encoding="utf-8"))
-    print("Merge dir:", os.path.join(repo.repo_path, "merge"))
-    print("Test done. Remove temp dir when finished:", tmp)
