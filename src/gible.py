@@ -96,7 +96,7 @@ class RepoListScreen(ctk.CTkFrame):
         self.refresh_repo_cards()
 
     # ----------------------------------------------------------------------
-    # NEW: Import Logic
+    # Import Logic
     # ----------------------------------------------------------------------
     def import_repository(self):
         # 1. Select ZIP file
@@ -452,7 +452,7 @@ class ExplorerEditorScreen(ctk.CTkFrame):
             if self.active_editor:
                 self.active_editor.pack_forget()
             lbl = tk.Label(self.editor_frame, text=f"# Folder: {full_path.name}",
-                           bg="#1f1f1f", fg="#555555", font=mono_font)
+                           bg="#02202E", fg="#555555", font=mono_font)
             lbl.pack(expand=True)
             self.active_editor = lbl
             return
@@ -471,7 +471,7 @@ class ExplorerEditorScreen(ctk.CTkFrame):
         if str_path in self.file_editors:
             # Retrieve existing widget (preserves undo stack!)
             self.active_editor = self.file_editors[str_path]
-            self.active_editor.pack(fill="both", expand=True)
+            self.active_editor.pack(fill="both", expand=True, padx=(0,60), pady=(0,80))
             # Ensure focus so typing works immediately
             self.active_editor.focus_set()
         else:
@@ -479,17 +479,17 @@ class ExplorerEditorScreen(ctk.CTkFrame):
             try:
                 content = full_path.read_text(encoding='utf-8')
                 new_editor = tk.Text(
-                    self.editor_frame, bg="#1f1f1f", fg=editor_text_color,
+                    self.editor_frame, bg="#02202E", fg=editor_text_color,
                     font=mono_font, insertbackground=editor_text_color,
                     undo=True, maxundo=-1,  # Allow large undo
-                    highlightthickness=0, bd=0
+                    highlightthickness=0, bd=0, padx=20, pady=20
                 )
                 new_editor.insert("1.0", content)
 
                 # Reset the undo stack so "inserting initial content" isn't the first undo
                 new_editor.edit_reset()
 
-                new_editor.pack(fill="both", expand=True)
+                new_editor.pack(fill="both", expand=True, padx=(0,60), pady=(0,80))
 
                 # Store it
                 self.file_editors[str_path] = new_editor
@@ -576,7 +576,7 @@ class ExplorerEditorScreen(ctk.CTkFrame):
 
         # Show a placeholder label since no file is selected yet
         lbl = tk.Label(self.editor_frame, text="Select a file to edit",
-                       bg="#042A3A", fg="#97A0A4", font=mono_font)
+                       bg="#02202E", fg="#97A0A4", font=mono_font)
         lbl.pack(expand=True)
         # We store this label as active_editor temporarily just so pack_forget works later
         self.active_editor = lbl
@@ -910,6 +910,8 @@ class ExplorerEditorScreen(ctk.CTkFrame):
         except Exception as e:
             messagebox.showerror("Merge Error", str(e))
             return
+        
+        self.refresh_files()
 
         if not merge_result.get("success", False):
             if merge_result.get("conflicts"):
@@ -931,7 +933,7 @@ class ExplorerEditorScreen(ctk.CTkFrame):
                         pass
                     messagebox.showinfo("Merge", "Please resolve conflicts manually and then commit.")
                 else:
-                    messagebox.showinfo("Merge Aborted", "Merge aborted. Resolve conflicts manually or re-run after resolving.")
+                    messagebox.showinfo("Merged Forcefully", "Resolve conflicts manually.")
             else:
                 messagebox.showerror("Merge", merge_result.get("message", "Merge failed"))
             return
@@ -956,7 +958,7 @@ class App(ctk.CTk):
         screen_height = self.winfo_screenheight()
 
         # Set the window geometry to full screen
-        self.overrideredirect(False)
+        # self.overrideredirect(False)
         
         self.geometry(f"{screen_width}x{screen_height}+0+0")
         
