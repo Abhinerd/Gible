@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""
-Gible CLI (fixed deletion handling + 3-way merge + test)
-
-Changes made:
-- Properly record deletions in commit() as ["deleted", None]
-- reconstruct_file_bytes() returns None when a file was deleted in history
-- merge_branch() respects deletion rules (delete wins, or conflict when one side deletes and the other modifies)
-- checkout() renamed to restore_commit() and properly removes deleted files
-- switch_branch() updated to call restore_commit()
-- commit() treats a previous "deleted" as no previous content (stores base)
-- Minor helpers unchanged except adjusted to work with deletion semantics
-"""
 from __future__ import annotations
 import os
 import sys
@@ -77,7 +64,7 @@ def load_object(repo_path: str, oid: str, obj_type: str) -> bytes:
         return decompress_data(f.read())
 
 # -------------------------
-# Text diff generation/application
+# Text diff generation and application
 # -------------------------
 def generate_text_diff(old_bytes: bytes, new_bytes: bytes) -> bytes:
     old_lines = old_bytes.decode('utf-8').splitlines(keepends=True)
@@ -120,7 +107,7 @@ def apply_binary_diff(base_bytes: bytes, diff_bytes: bytes) -> bytes:
     return bsdiff4.patch(base_bytes, diff_bytes)
 
 # -------------------------
-# Index (staging) management
+# Index management
 # -------------------------
 class GibleIndex:
     def __init__(self, repo_path: str):
@@ -177,7 +164,7 @@ class GibleRepository:
     def init(self):
         if os.path.exists(self.repo_path):
             self._log(f"Repository already initialized at {self.repo_path}")
-            return {"success": False, "message": "Repository already initialized."} # Modified
+            return {"success": False, "message": "Repository already initialized."} 
         os.makedirs(self.objects_path, exist_ok=True)
         initial_config = {
             "version": "0.5.0-deletion-support",
@@ -196,7 +183,7 @@ class GibleRepository:
             json.dump(initial_metadata, f, indent=2, ensure_ascii=False)
         self.index.clear()
         self._log(f"Initialized Gible repository at {self.repo_path}")
-        return {"success": True, "message": "Repository initialized successfully."} # Modified
+        return {"success": True, "message": "Repository initialized successfully."} 
     
     def _log(self, message: str):
         if hasattr(self, 'output_buffer'): # Check if running in UI mode
@@ -356,8 +343,6 @@ class GibleRepository:
         staged = self.index.get_all()
 
         # 1. LOAD PREVIOUS STATE
-        # We must start with a copy of the files from the previous commit.
-        # Otherwise, any file we didn't touch in this commit will be lost.
         prev_files_map = {}
         if head:
             try:
@@ -371,7 +356,6 @@ class GibleRepository:
         previously_tracked_files = set(prev_files_map.keys())
         
         # Filter out files that were already marked 'deleted' in the previous commit
-        # (so we don't keep carrying 'deleted' tombstones forever)
         previously_tracked_files = {
             f for f in previously_tracked_files 
             if prev_files_map[f][0] != "deleted"
@@ -400,9 +384,6 @@ class GibleRepository:
 
             # CASE: Deleted on disk
             if not os.path.exists(abs_path):
-                # Mark as deleted. Depending on your restore logic, 
-                # you might want to keep this flag or remove the key entirely.
-                # Keeping it ensures restore_commit knows to delete the file.
                 new_files_map[filepath] = ["deleted", None]
                 self._log(f" {filepath}: deleted")
                 continue
@@ -437,7 +418,6 @@ class GibleRepository:
                 diff_bytes = generate_text_diff(last_bytes, current_bytes)
                 if not json.loads(diff_bytes.decode('utf-8')):
                     # No change detected, keep the old entry in new_files_map
-                    # (It is already there because we copied prev_files_map!)
                     self._log(f" {filepath}: no changes (skipped)")
                 else:
                     oid = save_object(self.repo_path, diff_bytes, "diff")
@@ -457,7 +437,7 @@ class GibleRepository:
         # create the commit
         commit_obj = {
             "parent": head,
-            "files": new_files_map, # Now contains Old Files + New/Changed Files
+            "files": new_files_map, 
             "message": message,
             "author": self.load_config().get("author", "unknown"),
             "timestamp": datetime.now().isoformat()
@@ -518,11 +498,11 @@ class GibleRepository:
         metadata = self.load_metadata()
         if name in metadata['branches']:
             self._log(f"Branch '{name}' already exists")
-            return {"success": False, "message": f"Branch '{name}' already exists"} # Modified
+            return {"success": False, "message": f"Branch '{name}' already exists"} 
         metadata['branches'][name] = metadata['head']
         self.save_metadata(metadata)
         self._log(f"Branch '{name}' created at {metadata['head'][:8] if metadata['head'] else 'None'}")
-        return {"success": True, "message": f"Branch '{name}' created."} # Modified
+        return {"success": True, "message": f"Branch '{name}' created."} 
     
     def switch_branch(self, name: str, silent: bool = False):
         metadata = self.load_metadata()
@@ -531,13 +511,13 @@ class GibleRepository:
             return {"success": False, "message": f"Branch '{name}' does not exist"}
 
         metadata['current_branch'] = name
-        head_commit = metadata['branches'][name] # <--- PROBLEM POINT 1
+        head_commit = metadata['branches'][name] 
 
         # Update main HEAD to point to branch tip
-        metadata['head'] = head_commit # <--- PROBLEM POINT 2 (if head_commit is a dict)
+        metadata['head'] = head_commit 
 
         if head_commit: # This check is good
-            self.restore_commit(head_commit, silent=True) # <--- PROBLEM POINT 3 (if head_commit is a dict)
+            self.restore_commit(head_commit, silent=True) 
 
         self.save_metadata(metadata)
         if not silent: self._log(f"Switched to branch '{name}'")
@@ -652,7 +632,7 @@ class GibleRepository:
 
         if current_head == other_head:
             self._log("Already up-to-date.")
-            return {"success": True, "message": "Already up-to-date."} # Modified
+            return {"success": True, "message": "Already up-to-date."} 
 
         if other_head and self._is_ancestor(other_head, current_head):
             try:
@@ -662,7 +642,7 @@ class GibleRepository:
                 meta = metadata.get("commits", {}).get(other_head, {})
                 msg = meta.get("message", "<no message>")
             self._log(f"Branch '{current_branch}' already includes '{other_branch}' ({msg} @ {other_head[:8]}).")
-            return {"success": True, "message": f"Branch '{current_branch}' already includes '{other_branch}'."} # Modified
+            return {"success": True, "message": f"Branch '{current_branch}' already includes '{other_branch}'."} 
 
         if current_head and self._is_ancestor(current_head, other_head):
             self._log(f"Fast-forwarding '{current_branch}' to '{other_branch}'...")
@@ -671,7 +651,7 @@ class GibleRepository:
             metadata['head'] = other_head
             self.save_metadata(metadata)
             self._log(f"Fast-forwarded {current_branch} -> {other_head[:8]}")
-            return {"success": True, "message": f"Fast-forwarded to {other_branch}."} # Modified
+            return {"success": True, "message": f"Fast-forwarded to {other_branch}."} 
 
         base_head = self._find_common_ancestor(current_head, other_head)
         self._log(f"Merging '{other_branch}' ({other_head[:8] if other_head else 'None'}) into '{current_branch}' ({current_head[:8] if current_head else 'None'})")
@@ -831,7 +811,7 @@ class GibleRepository:
         metadata['head'] = commit_oid
         self.save_metadata(metadata)
         self._log(f"Updated {current_branch} -> {commit_oid[:8]}")
-        return {"success": True, "message": "Merge completed successfully."} # Modified
+        return {"success": True, "message": "Merge completed successfully."} 
 
     # -------------------------
     # Helpers: commit tree, restore (was checkout)
@@ -924,7 +904,7 @@ class GibleRepository:
         
         if not silent: # Only log if not silent
             self._log(f"Restored commit {commit_oid[:8]}")
-        return {"success": True, "message": f"Restored commit {commit_oid[:8]}"} # Modified
+        return {"success": True, "message": f"Restored commit {commit_oid[:8]}"} 
 
     # -------------------------
     # Status
@@ -946,7 +926,7 @@ class GibleRepository:
     def destroy(self):
         if not self.is_repo():
             self._log("Not a Gible repository. Nothing to destroy.")
-            return {"success": False, "message": "Not a Gible repository. Nothing to destroy."} # Modified
+            return {"success": False, "message": "Not a Gible repository. Nothing to destroy."} 
 
         # Remove the confirmation prompt, UI will handle it
         # confirm = input(f"This will permanently delete the Gible repository at {self.repo_path}.\nAre you sure? (y/n): ").strip().lower()
@@ -954,13 +934,13 @@ class GibleRepository:
         try:
             shutil.rmtree(self.repo_path)
             self._log(f"Gible repository at {self.repo_path} has been destroyed.")
-            return {"success": True, "message": f"Gible repository at {self.repo_path} has been destroyed."} # Modified
+            return {"success": True, "message": f"Gible repository at {self.repo_path} has been destroyed."} 
         except Exception as e:
             self._log(f"Error destroying repository: {e}")
-            return {"success": False, "message": f"Error destroying repository: {e}"} # Modified
+            return {"success": False, "message": f"Error destroying repository: {e}"} 
         # else:
         #     self._log("Destroy operation cancelled.")
-        #     return {"success": False, "message": "Destroy operation cancelled."} # Modified
+        #     return {"success": False, "message": "Destroy operation cancelled."} 
 
     # -------------------------
     # Convenience: branches & logs
@@ -972,9 +952,9 @@ class GibleRepository:
     
     def list_branches(self):
         metadata = self.load_metadata()
-        return list(metadata["branches"].keys()) # Modified
+        return list(metadata["branches"].keys()) 
 
-    def list_commits(self, branch_name: Optional[str] = None) -> List[Dict[str, str]]: # Modified signature
+    def list_commits(self, branch_name: Optional[str] = None) -> List[Dict[str, str]]: 
         metadata = self.load_metadata()
         head = metadata.get("head")
         if branch_name:
@@ -1060,75 +1040,3 @@ def run_merge_conflict_test():
     print(Path(os.path.join(tmp, "1.txt")).read_text(encoding="utf-8"))
     print("Merge dir:", os.path.join(repo.repo_path, "merge"))
     print("Test done. Remove temp dir when finished:", tmp)
-
-# # -------------------------
-# # CLI
-# # -------------------------
-# def main():
-#     if len(sys.argv) < 2:
-#         print("Usage: python gible_base.py <command> [...]")
-#         print("\nAvailable commands:")
-#         print("  init            - Initialize a new Gible repository")
-#         print("  add <path>      - Stage a file or directory for commit")
-#         print("  commit <msg>    - Record staged changes")
-#         print("  branch <name>   - Create a new branch")
-#         print("  switch <name>   - Switch to a different branch")
-#         print("  merge <name>    - Merge a branch into the current branch")
-#         print("  status          - Show the working tree status")
-#         print("  restore <id>    - Restore working dir to a specific commit (was checkout)")
-#         print("  destroy         - Permanently delete the Gible repository")
-#         print("  test-merge      - Run a pre-defined merge conflict test")
-#         print("  list-branches   - List branches")
-#         print("  log-commits     - Log commits of current branch")
-#         sys.exit(1)
-
-#     cmd = sys.argv[1]
-#     repo = GibleRepository(os.getcwd())
-
-#     if cmd == "init":
-#         repo.init()
-#     elif cmd == "add":
-#         if len(sys.argv) < 3:
-#             print("Usage: add <path>")
-#         else:
-#             repo.add(sys.argv[2])
-#     elif cmd == "commit":
-#         if len(sys.argv) < 3:
-#             print("Usage: commit <message>")
-#         else:
-#             repo.commit(sys.argv[2])
-#     elif cmd == "branch":
-#         if len(sys.argv) < 3:
-#             print("Usage: branch <name>")
-#         else:
-#             repo.create_branch(sys.argv[2])
-#     elif cmd == "switch":
-#         if len(sys.argv) < 3:
-#             print("Usage: switch <branch>")
-#         else:
-#             repo.switch_branch(sys.argv[2])
-#     elif cmd == "merge":
-#         if len(sys.argv) < 3:
-#             print("Usage: merge <branch>")
-#         else:
-#             repo.merge_branch(sys.argv[2])
-#     elif cmd == "status":
-#         repo.status()
-#     elif cmd == "restore":
-#         if len(sys.argv) < 3:
-#             print("Usage: restore <commit_oid>")
-#         else:
-#             repo.restore_commit(sys.argv[2])
-#     elif cmd == "test-merge":
-#         run_merge_conflict_test()
-#     elif cmd == "destroy":
-#         repo.destroy()
-#     elif cmd == "list-branches":
-#         repo.list_branches()
-#     elif cmd == "log-commits":
-#         repo.list_commits()
-#     else:
-#         print(f"Unknown command: {cmd}")
-
-# if __name__ == "__main__":
-#     main()

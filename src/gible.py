@@ -150,7 +150,7 @@ class RepoListScreen(ctk.CTkFrame):
             messagebox.showerror("Import Error", str(e))
 
     # ----------------------------------------------------------------------
-    # NEW: Export Logic
+    # Export Logic
     # ----------------------------------------------------------------------
     def export_repo(self, repo):
         # 1. Ask where to save the zip
@@ -520,8 +520,7 @@ class ExplorerEditorScreen(ctk.CTkFrame):
 
     def refresh_files(self):
         # When refreshing (or switching branches), files on disk change.
-        # We MUST destroy existing editors because their content/undo history
-        # is now invalid relative to the new file system state.
+        # Destroy existing editors because their content/undo history is now invalid relative to the new file system state.
         self.clear_editors()
 
         self.load_repo({"path": str(self.repo_path), "name": self.repo_path.name})
@@ -982,10 +981,7 @@ class App(ctk.CTk):
         frame.load_repo(repo_data)
         frame.tkraise()
 
-
-# -------------------------------
 # Run
-# -------------------------------
 if __name__ == "__main__":
     app = App()
     app.mainloop()
