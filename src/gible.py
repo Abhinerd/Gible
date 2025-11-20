@@ -907,6 +907,8 @@ class ExplorerEditorScreen(ctk.CTkFrame):
         except Exception as e:
             messagebox.showerror("Merge Error", str(e))
             return
+        
+        self.refresh_files()
 
         if not merge_result.get("success", False):
             if merge_result.get("conflicts"):
@@ -928,7 +930,7 @@ class ExplorerEditorScreen(ctk.CTkFrame):
                         pass
                     messagebox.showinfo("Merge", "Please resolve conflicts manually and then commit.")
                 else:
-                    messagebox.showinfo("Merge Aborted", "Merge aborted. Resolve conflicts manually or re-run after resolving.")
+                    messagebox.showinfo("Merged Forcefully", "Resolve conflicts manually.")
             else:
                 messagebox.showerror("Merge", merge_result.get("message", "Merge failed"))
             return
