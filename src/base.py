@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""
-Gible CLI (fixed deletion handling + 3-way merge + test)
-
-Changes made:
-- Properly record deletions in commit() as ["deleted", None]
-- reconstruct_file_bytes() returns None when a file was deleted in history
-- merge_branch() respects deletion rules (delete wins, or conflict when one side deletes and the other modifies)
-- checkout() renamed to restore_commit() and properly removes deleted files
-- switch_branch() updated to call restore_commit()
-- commit() treats a previous "deleted" as no previous content (stores base)
-- Minor helpers unchanged except adjusted to work with deletion semantics
-"""
 from __future__ import annotations
 import os
 import sys
@@ -28,7 +15,7 @@ import base64
 import tempfile
 
 # -------------------------
-# Configuration / Paths
+# Configuration
 # -------------------------
 GIBLE_REPO_DIR = ".gible"
 OBJECTS_DIR = "objects"
@@ -37,7 +24,7 @@ METADATA_FILE = "metadata.json"
 CONFIG_FILE = "config.json"
 
 # -------------------------
-# Low-level utilities
+# Low level util
 # -------------------------
 def calculate_hash(data: bytes, algo: str = "sha256") -> str:
     return hashlib.sha256(data).hexdigest() if algo != "sha1" else hashlib.sha1(data).hexdigest()
@@ -77,7 +64,7 @@ def load_object(repo_path: str, oid: str, obj_type: str) -> bytes:
         return decompress_data(f.read())
 
 # -------------------------
-# Text diff generation/application
+# Text diff handling
 # -------------------------
 def generate_text_diff(old_bytes: bytes, new_bytes: bytes) -> bytes:
     old_lines = old_bytes.decode('utf-8').splitlines(keepends=True)
