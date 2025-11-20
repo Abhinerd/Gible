@@ -318,7 +318,8 @@ class GibleRepository:
         abs_path = os.path.join(self.working_dir, filepath)
         if not os.path.exists(abs_path):
             self._log(f"Error: Path not found: {filepath}")
-            return {"success": False, "message": f"Path not found: {filepath}"} # Modified
+            return {"success": False, "message": f"Path not found: {filepath}"}
+
         paths_to_process = []
         if os.path.isfile(abs_path):
             paths_to_process.append(abs_path)
@@ -327,6 +328,8 @@ class GibleRepository:
                 dirs[:] = [d for d in dirs if d != GIBLE_REPO_DIR]
                 for name in files:
                     paths_to_process.append(os.path.join(root, name))
+
+        staged_count = 0
         for full_path in paths_to_process:
             rel = os.path.relpath(full_path, self.working_dir)
             try:
@@ -337,7 +340,11 @@ class GibleRepository:
             content_hash = calculate_hash(data)
             self.index.add_file(rel, content_hash, mode)
             self._log(f"Staged: {rel} (mode: {mode})")
-            return {"success": True, "message": f"Staged: {filepath}"} # Modified
+            staged_count += 1
+
+        if staged_count == 0:
+            return {"success": False, "message": f"No files staged for: {filepath}"}
+        return {"success": True, "message": f"Staged {staged_count} files"}
 
     # -------------------------
     # Commit
@@ -348,101 +355,133 @@ class GibleRepository:
         current_branch = metadata.get("current_branch", "master")
         staged = self.index.get_all()
 
-        # Automatically detect previously tracked files that are now missing on disk
-        previously_tracked_files = set()
+        # 1. LOAD PREVIOUS STATE
+        # We must start with a copy of the files from the previous commit.
+        # Otherwise, any file we didn't touch in this commit will be lost.
+        prev_files_map = {}
         if head:
-            previously_tracked_files = set(self.get_commit_tree(head).keys())
-        missing_files = {f for f in previously_tracked_files if not os.path.exists(os.path.join(self.working_dir, f))}
+            try:
+                full_last_commit = self._get_full_commit(head)
+                # Make a shallow copy of the files dict
+                prev_files_map = full_last_commit.get("files", {}).copy()
+            except FileNotFoundError:
+                prev_files_map = {}
 
-        # Combine staged files + missing files
+        # Identify missing files (deleted from disk but tracked in head)
+        previously_tracked_files = set(prev_files_map.keys())
+        
+        # Filter out files that were already marked 'deleted' in the previous commit
+        # (so we don't keep carrying 'deleted' tombstones forever)
+        previously_tracked_files = {
+            f for f in previously_tracked_files 
+            if prev_files_map[f][0] != "deleted"
+        }
+
+        missing_files = {
+            f for f in previously_tracked_files 
+            if not os.path.exists(os.path.join(self.working_dir, f))
+        }
+
         combined_files = staged.copy()
         for f in missing_files:
             if f not in combined_files:
-                combined_files[f] = {"mode": "text"}  # mode doesn't matter, it's deleted
+                combined_files[f] = {"mode": "text"} # Assume text for deletion handling
 
         if not combined_files:
             self._log("No changes staged or detected. Nothing to commit.")
-            # This is the return value that was causing issues if mistakenly stored
-            return {"success": False, "message": "No changes staged or detected. Nothing to commit."}
+            return {"success": False, "message": "No changes staged or detected."}
 
-        new_files_map: Dict[str, List[Optional[str]]] = {}
+        # 2. INITIALIZE NEW MAP WITH PREVIOUS FILES
+        new_files_map = prev_files_map.copy()
+
+        # 3. UPDATE WITH CHANGES
         for filepath, info in combined_files.items():
             abs_path = os.path.join(self.working_dir, filepath)
 
-            # ---- handle deleted file on disk: record deletion ----
+            # CASE: Deleted on disk
             if not os.path.exists(abs_path):
+                # Mark as deleted. Depending on your restore logic, 
+                # you might want to keep this flag or remove the key entirely.
+                # Keeping it ensures restore_commit knows to delete the file.
                 new_files_map[filepath] = ["deleted", None]
-                self._log(f"  {filepath}: deleted")
+                self._log(f" {filepath}: deleted")
                 continue
 
-            # file exists on disk -> normal processing
+            # CASE: Modified or New
             current_bytes = Path(abs_path).read_bytes()
             is_text = (info.get("mode") == "text")
-            prev_entry = None
-            if head:
-                try:
-                    full_commit = self._get_full_commit(head)
-                    prev_entry = full_commit.get("files", {}).get(filepath)
-                except FileNotFoundError:
-                    prev_entry = None
+            
+            # Get previous entry from the map we just loaded
+            prev_entry = prev_files_map.get(filepath)
 
-            # if no previous recorded entry -> store base
-            if prev_entry is None:
+            # If this is a completely new file (not in previous commit)
+            if prev_entry is None or prev_entry[0] == "deleted":
                 oid = save_object(self.repo_path, current_bytes, "base")
                 new_files_map[filepath] = ["base", oid]
-                self._log(f"  {filepath}: stored base ({oid[:8]})")
-            else:
-                # reconstruct last content; reconstruct may return None if file was deleted in history
-                try:
-                    last_bytes = self.reconstruct_file_bytes(head, filepath)
-                except FileNotFoundError:
-                    last_bytes = None
+                self._log(f" {filepath}: stored base ({oid[:8]})")
+                continue
 
-                # treat last_bytes None as "no previous content" (store base)
-                if last_bytes is None:
+            # Reconstruct previous version for diffing
+            try:
+                last_bytes = self.reconstruct_file_bytes(head, filepath)
+            except FileNotFoundError:
+                last_bytes = None
+
+            if last_bytes is None:
+                oid = save_object(self.repo_path, current_bytes, "base")
+                new_files_map[filepath] = ["base", oid]
+                self._log(f" {filepath}: stored base ({oid[:8]})")
+                continue
+
+            if is_text:
+                diff_bytes = generate_text_diff(last_bytes, current_bytes)
+                if not json.loads(diff_bytes.decode('utf-8')):
+                    # No change detected, keep the old entry in new_files_map
+                    # (It is already there because we copied prev_files_map!)
+                    self._log(f" {filepath}: no changes (skipped)")
+                else:
+                    oid = save_object(self.repo_path, diff_bytes, "diff")
+                    new_files_map[filepath] = ["diff", oid]
+                    self._log(f" {filepath}: stored text diff ({oid[:8]})")
+            else:
+                bin_diff = generate_binary_diff(last_bytes, current_bytes)
+                if len(bin_diff) < len(current_bytes):
+                    oid = save_object(self.repo_path, bin_diff, "diff")
+                    new_files_map[filepath] = ["diff", oid]
+                    self._log(f" {filepath}: stored binary diff ({oid[:8]})")
+                else:
                     oid = save_object(self.repo_path, current_bytes, "base")
                     new_files_map[filepath] = ["base", oid]
-                    self._log(f"  {filepath}: stored base ({oid[:8]})")
-                    continue
+                    self._log(f" {filepath}: stored binary base ({oid[:8]})")
 
-                if is_text:
-                    diff_bytes = generate_text_diff(last_bytes, current_bytes)
-                    if not json.loads(diff_bytes.decode('utf-8')):
-                        new_files_map[filepath] = prev_entry
-                        self._log(f"  {filepath}: no changes (skipped)")
-                    else:
-                        oid = save_object(self.repo_path, diff_bytes, "diff")
-                        new_files_map[filepath] = ["diff", oid]
-                        self._log(f"  {filepath}: stored text diff ({oid[:8]})")
-                else:
-                    bin_diff = generate_binary_diff(last_bytes, current_bytes)
-                    if len(bin_diff) < len(current_bytes):
-                        oid = save_object(self.repo_path, bin_diff, "diff")
-                        new_files_map[filepath] = ["diff", oid]
-                        self._log(f"  {filepath}: stored binary diff ({oid[:8]})")
-                    else:
-                        oid = save_object(self.repo_path, current_bytes, "base")
-                        new_files_map[filepath] = ["base", oid]
-                        self._log(f"  {filepath}: stored binary base ({oid[:8]})")
+        # create the commit
+        commit_obj = {
+            "parent": head,
+            "files": new_files_map, # Now contains Old Files + New/Changed Files
+            "message": message,
+            "author": self.load_config().get("author", "unknown"),
+            "timestamp": datetime.now().isoformat()
+        }
+    
+        commit_oid = self._write_commit_object(commit_obj)
 
-            commit_obj = {
-                "parent": head, # head is a string or None, which is fine
-                "files": new_files_map,
-                "message": message,
-                "author": self.load_config().get("author", "unknown"),
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            commit_oid = self._write_commit_object(commit_obj) # This returns a string OID
-            # The _write_commit_object *already* updates metadata["head"] and metadata["branches"][current_branch]
-            # So there's no need for commit() to do it again here.
+        # ---------------------------------------------------------
+        # Update the Branch and HEAD
+        # ---------------------------------------------------------
+        metadata["head"] = commit_oid
+        if current_branch:
+            metadata["branches"][current_branch] = commit_oid
+        
+        self.save_metadata(metadata)
+        # ---------------------------------------------------------
 
-            self._log(f"[{current_branch}] {message}")
-            self._log(f"  commit {commit_oid}")
-            self.index.clear()
-            self._log("Staging area cleared.")
-            return {"success": True, "commit_oid": commit_oid, "message": f"Committed: {commit_oid[:8]}"}
-
+        self._log(f"[{current_branch}] {message}")
+        self._log(f" commit {commit_oid}")
+        
+        self.index.clear()
+        self._log("Staging area cleared.")
+        
+        return {"success": True, "commit_oid": commit_oid, "message": f"Committed: {commit_oid[:8]}"}
 
     # -------------------------
     # Branch utilities / ancestors
